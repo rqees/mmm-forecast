@@ -332,6 +332,33 @@ def normalize_time(df, time_col):
     return df.sort_values(time_col).reset_index(drop=True)
 
 
+def season_col_names(k):
+    """Names of the generated seasonal control columns for k harmonics."""
+    return [f"season_{f}{i}" for i in range(1, k + 1) for f in ("sin", "cos")]
+
+
+def season_values(dates, k):
+    """Fourier terms of the yearly cycle, shape (n, 2k), ordered sin1, cos1, sin2, cos2, ...
+    A given calendar date gets the same values every year, which is what lets the
+    model learn 'December is high' from past Decembers and apply it to future ones."""
+    doy = pd.DatetimeIndex(dates).dayofyear.values.astype(float)
+    ang = 2 * np.pi * doy / 365.25
+    cols = []
+    for i in range(1, k + 1):
+        cols += [np.sin(i * ang), np.cos(i * ang)]
+    return np.column_stack(cols) if cols else np.zeros((len(doy), 0))
+
+
+def add_season_cols(df, time_col, k):
+    df = df.copy()
+    names = season_col_names(k)
+    if names:
+        vals = season_values(pd.to_datetime(df[time_col]), k)
+        for i, n in enumerate(names):
+            df[n] = vals[:, i]
+    return df
+
+
 def aggregate_to_national(df, cfg):
     channels = cfg["channels"]
     media_cols = [f"{ch}{cfg['impression_suffix']}" for ch in channels]
@@ -539,12 +566,15 @@ def build_future_data_tensors(fc, cfg, last_date):
     org = np.zeros((1, n_weeks, len(cfg["organic_cols"])))
     for i, c in enumerate(cfg["organic_cols"]):
         org[0, :, i] = fc["organic"][c]
-    ctl = np.zeros((1, n_weeks, len(cfg["control_cols"])))
-    for i, c in enumerate(cfg["control_cols"]):
-        ctl[0, :, i] = fc["controls"][c]
-
     last_dt = pd.to_datetime(last_date)
     dates = [(last_dt + pd.Timedelta(weeks=w + 1)).strftime("%Y-%m-%d") for w in range(n_weeks)]
+
+    season_cols = cfg.get("season_cols", [])
+    ctl = np.zeros((1, n_weeks, len(cfg["control_cols"]) + len(season_cols)))
+    for i, c in enumerate(cfg["control_cols"]):
+        ctl[0, :, i] = fc["controls"][c]
+    if season_cols:  # order must match training: user controls first, then seasonal terms
+        ctl[0, :, len(cfg["control_cols"]):] = season_values(pd.to_datetime(dates), len(season_cols) // 2)
 
     td = dict(
         media=tf.convert_to_tensor(m, dtype=tf.float32),
@@ -556,7 +586,7 @@ def build_future_data_tensors(fc, cfg, last_date):
         td["non_media_treatments"] = tf.convert_to_tensor(nm, dtype=tf.float32)
     if cfg["organic_cols"]:
         td["organic_media"] = tf.convert_to_tensor(org, dtype=tf.float32)
-    if cfg["control_cols"]:
+    if ctl.shape[-1]:
         td["controls"] = tf.convert_to_tensor(ctl, dtype=tf.float32)
     return deps["analyzer"].DataTensors(**td), dates
 
@@ -629,7 +659,7 @@ def train_model(national_df, cfg, log, holdout_mask=None):
     # Meridian's builder wants a 'time' column and will treat any 'geo' column as geo data,
     # so pass a clean frame containing only what the model needs.
     keep = [cfg["time_col"], cfg["kpi_col"], cfg["rev_per_kpi_col"]] + media_cols + spend_cols \
-           + cfg["non_media_cols"] + cfg["organic_cols"] + cfg["control_cols"]
+           + cfg["non_media_cols"] + cfg["organic_cols"] + cfg["control_cols"] + cfg.get("season_cols", [])
     df = national_df[keep].copy().rename(columns={cfg["time_col"]: "time"})
     df["time"] = pd.to_datetime(df["time"]).dt.strftime("%Y-%m-%d")
     for c in df.columns:
@@ -648,8 +678,9 @@ def train_model(national_df, cfg, log, holdout_mask=None):
     if cfg["organic_cols"]:
         builder = builder.with_organic_media(df, organic_media_cols=cfg["organic_cols"],
                                              organic_media_channels=cfg["organic_names"])
-    if cfg["control_cols"]:
-        builder = builder.with_controls(df, control_cols=cfg["control_cols"])
+    ctl_cols = cfg["control_cols"] + cfg.get("season_cols", [])  # user controls first, then seasonal terms
+    if ctl_cols:
+        builder = builder.with_controls(df, control_cols=ctl_cols)
     data = builder.build()
 
     prior = deps["prior_cls"](
@@ -809,10 +840,12 @@ def load_bundle(path):
     with open(cfg_path) as f:
         saved = json.load(f)
     keys = ["time_col", "geo_col", "kpi_col", "rev_per_kpi_col", "channels", "impression_suffix",
-            "spend_suffix", "non_media_cols", "organic_cols", "organic_names", "control_cols", "roi_mu", "roi_sigma",
-            "n_chains", "n_adapt", "n_burnin", "n_keep", "n_prior_samples", "n_future_weeks", "seed"]
+            "spend_suffix", "non_media_cols", "organic_cols", "organic_names", "control_cols", "seasonality_k", "season_cols",
+            "roi_mu", "roi_sigma", "n_chains", "n_adapt", "n_burnin", "n_keep", "n_prior_samples", "n_future_weeks", "seed"]
     cfg = {k: saved[k] for k in keys if k in saved}
     cfg.setdefault("control_cols", [])  # bundles saved before controls were supported
+    cfg.setdefault("seasonality_k", 0)
+    cfg.setdefault("season_cols", [])
     ndf = pd.DataFrame(saved["national_data"])
     for c in ndf.columns:
         if c != cfg["time_col"]:
@@ -1264,13 +1297,18 @@ def page_config():
     # ---- 3. Model settings ----
     with card("card_settings"):
         card_title("Model settings", step=3)
-        ms1, ms2, ms3 = st.columns(3)
+        ms1, ms2, ms3, ms4 = st.columns(4)
         with ms1:
             roi_mu = st.number_input("ROI prior μ (log-normal)", value=0.2, step=0.1, format="%.2f")
         with ms2:
             roi_sigma = st.number_input("ROI prior σ", value=0.9, min_value=0.05, step=0.1, format="%.2f")
         with ms3:
             n_future_weeks = st.number_input("Forecast horizon (weeks)", value=13, min_value=1, max_value=52)
+        with ms4:
+            season_k = st.number_input("Seasonality harmonics", value=2, min_value=0, max_value=4,
+                                       help="Adds yearly sine/cosine terms as control variables so the baseline can be "
+                                            "seasonal (0 = off). Each harmonic adds two columns; 2 captures an annual and "
+                                            "a semi-annual cycle. They are generated from the dates, nothing to add to your file.")
         with st.expander("Sampling (MCMC)"):
             sm1, sm2, sm3, sm4 = st.columns(4)
             with sm1:
@@ -1286,7 +1324,7 @@ def page_config():
         time_col=time_col, geo_col=geo_col, kpi_col=kpi_col, rev_per_kpi_col=rpk_col,
         channels=channels, impression_suffix=imp_suffix, spend_suffix=spend_suffix,
         non_media_cols=non_media_cols, organic_cols=organic_cols, organic_names=organic_names,
-        control_cols=control_cols,
+        control_cols=control_cols, seasonality_k=int(season_k), season_cols=season_col_names(int(season_k)),
         roi_mu=float(roi_mu), roi_sigma=float(roi_sigma),
         n_chains=int(n_chains), n_adapt=int(n_adapt), n_burnin=int(n_burnin), n_keep=int(n_keep),
         n_prior_samples=500, n_future_weeks=int(n_future_weeks), seed=42,
@@ -1309,6 +1347,7 @@ def page_config():
             st.error(f"Time column `{time_col}` cannot be parsed as dates: {e}")
             st.stop()
 
+        candidate = add_season_cols(candidate, time_col, cfg["seasonality_k"])
         errors, warns = validate_national(candidate, cfg)
         n_q = len(complete_quarters(candidate, time_col))
 
