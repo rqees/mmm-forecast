@@ -393,7 +393,7 @@ def validate_national(df, cfg):
         errors.append(f"Time column `{tcol}` cannot be parsed as dates.")
         return errors, warns
     if dt.duplicated().any():
-        errors.append(f"Duplicate dates in `{tcol}` — set a geo column or check for duplicate rows.")
+        errors.append(f"Duplicate dates in `{tcol}`. Set a geo column or remove duplicate rows.")
     if len(df) < 2:
         errors.append("Fewer than 2 rows of data.")
         return errors, warns
@@ -401,7 +401,7 @@ def validate_national(df, cfg):
     if not gaps.empty and (gaps.nunique() > 1 or gaps.iloc[0] != 7):
         warns.append(f"Dates are not evenly weekly (gaps: {sorted(gaps.unique().tolist())} days). Meridian assumes regular weekly periods.")
     if len(df) < 52:
-        warns.append(f"Only {len(df)} weeks of data — MMM results will be unreliable below ~1 year.")
+        warns.append(f"{len(df)} weeks of data. Estimates may be unreliable with fewer than 52 weeks.")
 
     # Required numeric columns
     req = ([cfg["kpi_col"], cfg["rev_per_kpi_col"]]
@@ -426,9 +426,9 @@ def validate_national(df, cfg):
 
     for ch in channels:
         if df[f"{ch}{cfg['spend_suffix']}"].sum() <= 0:
-            errors.append(f"Channel `{ch}` has zero total spend — remove it from Channels.")
+            errors.append(f"Channel `{ch}` has zero total spend. Remove it from Channels.")
         if df[f"{ch}{cfg['impression_suffix']}"].sum() <= 0:
-            errors.append(f"Channel `{ch}` has zero total impressions — remove it from Channels.")
+            errors.append(f"Channel `{ch}` has zero total impressions. Remove it from Channels.")
     if df[cfg["kpi_col"]].sum() <= 0:
         errors.append("KPI column sums to zero.")
     zero_kpi = int((df[cfg["kpi_col"]] <= 0).sum())
@@ -602,9 +602,8 @@ def constraint_label(c):
 
 def shift_slider(key, label="Max shift per channel (%)"):
     return st.slider(label, 5, MAX_SHIFT_PCT, 30, 5, key=key,
-                     help="How far the optimizer may move each channel from its status-quo spend. "
-                          "Up to 100% this is symmetric (a channel can shrink or grow by this much). "
-                          "Above 100% a channel can be cut to zero and grown by up to this much; "
+                     help="Maximum change in each channel's spend relative to status quo. Up to 100% the bound is "
+                          "symmetric. Above 100% a channel may be reduced to zero and increased by up to this amount; "
                           f"{MAX_SHIFT_PCT}% is effectively unconstrained.") / 100
 
 
@@ -655,7 +654,7 @@ def train_model(national_df, cfg, log, holdout_mask=None):
     media_cols = [f"{ch}{cfg['impression_suffix']}" for ch in channels]
     spend_cols = [f"{ch}{cfg['spend_suffix']}" for ch in channels]
 
-    log("Building InputData...")
+    log("Building input data")
     # Meridian's builder wants a 'time' column and will treat any 'geo' column as geo data,
     # so pass a clean frame containing only what the model needs.
     keep = [cfg["time_col"], cfg["kpi_col"], cfg["rev_per_kpi_col"]] + media_cols + spend_cols \
@@ -689,18 +688,18 @@ def train_model(national_df, cfg, log, holdout_mask=None):
     spec_kw = dict(prior=prior)
     if holdout_mask is not None:
         spec_kw["holdout_id"] = np.asarray(holdout_mask, dtype=bool)
-        log(f"Holding out {int(spec_kw['holdout_id'].sum())} of {len(spec_kw['holdout_id'])} weeks from the likelihood.")
+        log(f"Holdout: {int(spec_kw['holdout_id'].sum())} of {len(spec_kw['holdout_id'])} weeks excluded from the likelihood")
     mmm = deps["model_cls"](input_data=data, model_spec=deps["spec_cls"](**spec_kw))
 
-    log(f"Sampling prior ({cfg['n_prior_samples']} samples)...")
+    log(f"Sampling prior · {cfg['n_prior_samples']} draws")
     mmm.sample_prior(cfg["n_prior_samples"])
 
-    log(f"Sampling posterior — {cfg['n_chains']} chains × {cfg['n_keep']} kept "
-        f"(+{cfg['n_adapt']} adapt, +{cfg['n_burnin']} burn-in). This is the slow step.")
+    log(f"Sampling posterior · {cfg['n_chains']} chains × {cfg['n_keep']} draws "
+        f"({cfg['n_adapt']} adaptation, {cfg['n_burnin']} burn-in)")
     t0 = time.time()
     mmm.sample_posterior(n_chains=cfg["n_chains"], n_adapt=cfg["n_adapt"],
                          n_burnin=cfg["n_burnin"], n_keep=cfg["n_keep"], seed=cfg.get("seed", 42))
-    log(f"Posterior sampled in {(time.time() - t0) / 60:.1f} min.")
+    log(f"Posterior sampling complete · {(time.time() - t0) / 60:.1f} min")
     return mmm
 
 
@@ -758,11 +757,11 @@ def run_backtest(bt_q, national_df, cfg, constraint, quick, log):
     if quick:
         bt_cfg.update(n_chains=min(cfg["n_chains"], 2), n_keep=min(cfg["n_keep"], 250),
                       n_adapt=min(cfg["n_adapt"], 500), n_burnin=min(cfg["n_burnin"], 250))
-    log(f"Retraining on {len(upto)} weeks through {upto[tcol].max()} with {int(mask.sum())} holdout weeks...")
+    log(f"Fitting on {len(upto)} weeks through {upto[tcol].max()} · {int(mask.sum())} holdout weeks")
     mmm_bt = train_model(upto, bt_cfg, log, holdout_mask=mask)
 
     # Model test: expected revenue per week given the media that actually ran
-    log("Predicting holdout weeks...")
+    log("Computing expected revenue")
     an = deps["analyzer"].Analyzer(mmm_bt)
     eo = an.expected_outcome(aggregate_geos=True, aggregate_times=False, use_kpi=False)
     eo = eo.numpy() if hasattr(eo, "numpy") else np.asarray(eo)
@@ -788,7 +787,7 @@ def run_backtest(bt_q, national_df, cfg, constraint, quick, log):
     a_ctl = {c: float(actual[c].mean()) for c in cfg.get("control_cols", [])}
 
     # Reference: recommendation from the held-out model
-    log("Running optimizer on the held-out model...")
+    log("Running optimizer")
     res = run_optimizer(mmm_bt, fc, cfg, constraint, last_date=dt.max())
 
     return {
@@ -1063,7 +1062,7 @@ def show_error(msg, exc=True):
 # ===================================================================
 
 def page_config():
-    page_title("Configuration", "Upload weekly data, map columns, train the Meridian model — or load a saved one.")
+    page_title("Configuration", "Upload weekly data, map columns and train the model, or load a saved model.")
 
     trained = model_ready()
 
@@ -1071,7 +1070,7 @@ def page_config():
     top_l, top_r = st.columns([3, 2], gap="medium")
     with top_l:
         with card("card_status"):
-            card_title("Model status", "Stays in memory while you switch pages; lost if the Colab runtime disconnects.")
+            card_title("Model status", "Held in session memory for the current runtime")
             if trained:
                 _c, _n = S("cfg"), S("national_df")
                 tc = _c["time_col"]
@@ -1119,7 +1118,7 @@ def page_config():
 
         up_df = S("uploaded_df")
         if up_df is None:
-            st.caption("Wide (one row per week, channels as columns) or long (one row per week × channel) both work.")
+            st.caption("Accepts wide (one row per week) or long (one row per week × channel) layouts.")
             st.stop()
 
         st.caption(f"{up_df.shape[0]:,} rows × {up_df.shape[1]} columns")
@@ -1148,8 +1147,8 @@ def page_config():
         with lc0:
             layout = st.segmented_control("Data layout", ["Wide", "Long"], default=lay_default, key="layout_mode") or lay_default
         with lc1:
-            st.caption("**Wide** — one row per week, channels as columns (search_spend, search_impression, …).  \n"
-                       "**Long** — one row per week × channel (columns like: week, channel, cost, impr).")
+            st.caption("**Wide**: one row per week, channels as columns (search_spend, search_impression, …).  \n"
+                       "**Long**: one row per week × channel (e.g. week, channel, cost, impr).")
 
         if layout == "Long":
             def _idx(name, fallback=0):
@@ -1176,7 +1175,7 @@ def page_config():
             ch_spend = up_df.groupby(l_channel)[l_spend].sum()
             dead = ch_spend[ch_spend <= 0].index.tolist()
             if dead:
-                st.warning(f"Dropping channels with zero total spend (can't be modelled): {', '.join(map(str, dead))}")
+                st.warning(f"Channels with zero total spend excluded: {', '.join(map(str, dead))}")
             keep = up_df[~up_df[l_channel].isin(dead)]
             if keep.empty:
                 st.error("No channels with spend.")
@@ -1201,12 +1200,12 @@ def page_config():
                 p.columns = [f"{ch}_{c}" for ch in p.columns]
                 parts.append(p)
             if per_channel:
-                st.caption(f"Per-channel columns pivoted as extras: {', '.join(per_channel)}")
+                st.caption(f"Per-channel columns pivoted: {', '.join(per_channel)}")
 
             raw_df = pd.concat(parts, axis=1).reset_index().fillna(0)
             st.session_state.raw_df = raw_df
             st.session_state.long_defaults = dict(time=l_time, week_level=week_level, geo=l_geo)
-            st.success(f"Pivoted to wide: {raw_df.shape[0]:,} rows × {raw_df.shape[1]} columns")
+            st.success(f"Pivoted to wide layout: {raw_df.shape[0]:,} rows × {raw_df.shape[1]} columns")
             _df(raw_df.head(5), height=200)
         else:
             st.session_state.raw_df = up_df
@@ -1285,13 +1284,13 @@ def page_config():
         rm1, rm2, rm3 = st.columns(3)
         with rm1:
             non_media_cols = st.multiselect("Non-media treatment columns", remaining, key="m_nm",
-                                            help="Levers you set, e.g. price or promo depth. Meridian estimates their incremental effect.")
+                                            help="Treatments under the advertiser's control, e.g. price or promotion depth. An incremental effect is estimated.")
         with rm2:
             organic_cols = st.multiselect("Organic media columns", [c for c in remaining if c not in non_media_cols], key="m_org")
         with rm3:
             control_cols = st.multiselect("Control columns", [c for c in remaining if c not in non_media_cols and c not in organic_cols],
-                                          key="m_ctl", help="External drivers you don't set, e.g. Google Query Volume (GQV), weather, "
-                                                            "macro indices. Meridian uses them to de-confound media, not as treatments.")
+                                          key="m_ctl", help="External covariates, e.g. Google query volume, weather, macro indices. "
+                                                            "Included as controls; no incremental effect is estimated.")
         organic_names = [c[:-len(imp_suffix)] if c.endswith(imp_suffix) else c for c in organic_cols]
 
     # ---- 3. Model settings ----
@@ -1306,9 +1305,8 @@ def page_config():
             n_future_weeks = st.number_input("Forecast horizon (weeks)", value=13, min_value=1, max_value=52)
         with ms4:
             season_k = st.number_input("Seasonality harmonics", value=2, min_value=0, max_value=4,
-                                       help="Adds yearly sine/cosine terms as control variables so the baseline can be "
-                                            "seasonal (0 = off). Each harmonic adds two columns; 2 captures an annual and "
-                                            "a semi-annual cycle. They are generated from the dates, nothing to add to your file.")
+                                       help="Yearly sine/cosine terms added as control variables (0 = off). Each harmonic adds two "
+                                            "terms; 2 captures annual and semi-annual cycles. Generated from the time column.")
         with st.expander("Sampling (MCMC)"):
             sm1, sm2, sm3, sm4 = st.columns(4)
             with sm1:
@@ -1365,7 +1363,7 @@ def page_config():
         for e in errors:
             st.error(e)
         if n_q < 5:
-            st.caption("Fewer than 5 complete quarters — year-over-year trends need ≥ 5; the app falls back to quarter-over-quarter.")
+            st.caption("Fewer than 5 complete quarters: growth multipliers use quarter-over-quarter rates.")
 
         if _btn("Train model", icon=":material/rocket_launch:", type="primary", disabled=bool(errors)):
             st.session_state.national_df = candidate
@@ -1394,9 +1392,9 @@ def page_config():
     # ---- 5. Save ----
     if trained:
         with card("card_save"):
-            card_title("Save model", "Saves the model (.binpb) and a config JSON next to it", step=5)
+            card_title("Save model", "Writes the model (.binpb) and a configuration JSON alongside it", step=5)
             if not os.path.isdir("/content/drive/MyDrive") and os.path.isdir("/content"):
-                st.warning("Google Drive is not mounted — the save will only live on this runtime and vanish on disconnect.")
+                st.warning("Google Drive is not mounted. Files saved to the runtime are lost when it disconnects.")
             sc1, sc2 = st.columns([4, 1], vertical_alignment="bottom")
             with sc1:
                 save_path = st.text_input("Save path", value=os.path.join(default_save_dir(), "saved_mmm.binpb"))
@@ -1417,7 +1415,7 @@ def page_config():
 # ===================================================================
 
 def page_forecast():
-    page_title("Forecast & optimize", "Project next quarter from same-quarter-last-year actuals × trend, then let the optimizer reallocate the budget.")
+    page_title("Forecast & optimize", "Projects the selected quarter from same-quarter-prior-year actuals and growth multipliers, then optimizes the channel allocation.")
     require_model()
 
     mmm, cfg = S("mmm"), S("cfg")
@@ -1437,7 +1435,7 @@ def page_forecast():
             forecast_q = st.selectbox("Forecast quarter", fq_opts, index=fq_def, key="fc_q")
         with q2:
             growth_mult = st.slider("Growth rate multiplier", 0.8, 1.3, 1.0, 0.01, key="fc_gm",
-                                    help="Scales every trend. 1.0 = historical growth; 0.8 = 80% of it; 1.3 = 130%.")
+                                    help="Scales all growth multipliers. 1.0 applies historical growth; 0.8 applies 80% of it.")
         with q3:
             constraint = shift_slider("fc_con")
 
@@ -1449,8 +1447,8 @@ def page_forecast():
             st.error(f"No usable baseline data for {corr_label}.")
             st.stop()
 
-        st.caption(f"Baseline: **{corr_label}** actuals ({base['n_baseline_weeks']} weeks) × trend × {growth_mult:.2f}. "
-                   f"Inputs below reset to these defaults when you change quarter or growth; edit them to override.")
+        st.caption(f"Baseline: **{corr_label}** actuals ({base['n_baseline_weeks']} weeks) × growth multipliers × {growth_mult:.2f}. "
+                   "Inputs below reset to these defaults when the quarter or growth multiplier changes.")
 
     # ---- Assumptions ----
     wk = f"{forecast_q}_{growth_mult:.2f}"  # inputs keyed on (quarter, growth) so they reset when either changes
@@ -1460,11 +1458,11 @@ def page_forecast():
         kpi_row([
             {"label": "Budget", "value": fmt_money(base["total_budget"]),
              "delta": fmt_growth(spend_g), "delta_dir": "up" if spend_g >= 1 else "down",
-             "sub": f"Last year: ${base['total_budget_naive']:,.0f}"},
+             "sub": f"Prior year: ${base['total_budget_naive']:,.0f}"},
             {"label": "Revenue per KPI", "value": f"${base['rev_per_kpi']:,.2f}",
              "delta": fmt_growth(adj_trends.get("rev_per_kpi", 1.0)),
              "delta_dir": "up" if adj_trends.get("rev_per_kpi", 1.0) >= 1 else "down",
-             "sub": f"Last year: ${base['rev_per_kpi_naive']:,.4f}"},
+             "sub": f"Prior year: ${base['rev_per_kpi_naive']:,.4f}"},
             {"label": "Horizon", "value": f"{base['n_future_weeks']} wk", "sub": f"Baseline {base['n_baseline_weeks']} wk"},
             {"label": "Channels", "value": f"{len(channels)}", "sub": f"{constraint_label(constraint)} max shift"},
         ])
@@ -1484,7 +1482,7 @@ def page_forecast():
                 with cols[i % len(cols)]:
                     cpi[ch] = st.number_input(ch, min_value=0.0, value=float(base["cost_per_impression"][ch]),
                                               step=0.0001, format="%.6f", key=f"cpi_{ch}_{wk}")
-                    st.caption(f"Last year: {base['cost_per_impression_naive'][ch]:.6f}")
+                    st.caption(f"Prior year: {base['cost_per_impression_naive'][ch]:.6f}")
 
         nm = {}
         if cfg["non_media_cols"]:
@@ -1493,18 +1491,18 @@ def page_forecast():
                 for i, c in enumerate(cfg["non_media_cols"]):
                     with cols[i % len(cols)]:
                         nm[c] = st.number_input(c, value=float(base["non_media"][c]), step=0.01, format="%.4f", key=f"nm_{c}_{wk}")
-                        st.caption(f"Last year: {base['non_media_naive'][c]:.4f}")
+                        st.caption(f"Prior year: {base['non_media_naive'][c]:.4f}")
 
         ctl = {}
         if cfg.get("control_cols"):
-            with st.expander("Control levels (assumed, not optimized)"):
+            with st.expander("Control levels (held fixed)"):
                 cols = st.columns(min(len(cfg["control_cols"]), 3))
                 for i, c in enumerate(cfg["control_cols"]):
                     with cols[i % len(cols)]:
                         ctl[c] = st.number_input(c, value=float(base["controls"][c]), step=0.01, format="%.4f", key=f"ctl_{c}_{wk}")
-                        st.caption(f"Last year: {base['controls_naive'][c]:.4f}")
+                        st.caption(f"Prior year: {base['controls_naive'][c]:.4f}")
 
-        with st.expander("Trend summary (growth rates applied)"):
+        with st.expander("Growth multipliers applied"):
             rows = [{"Variable": f"{ch} spend", "Historical": fmt_growth(trend_multipliers.get(f"{ch}_spend", 1)),
                      "Applied": signed((adj_trends.get(f"{ch}_spend", 1) - 1) * 100, suffix="%")} for ch in channels]
             rows += [{"Variable": f"{ch} CPI", "Historical": fmt_growth(trend_multipliers.get(f"{ch}_cpi", 1)),
@@ -1539,7 +1537,7 @@ def page_forecast():
         return
 
     if r["quarter"] != forecast_q:
-        st.info(f"Showing results for {r['quarter']}. Run the optimizer to update for {forecast_q}.")
+        st.info(f"Results shown for {r['quarter']}. Run the optimizer to update for {forecast_q}.")
 
     gp = r["gain"] / r["sq_total"] * 100 if r["sq_total"] else 0
     with card("card_fc_kpis"):
@@ -1598,7 +1596,7 @@ def page_forecast():
 # ===================================================================
 
 def page_sensitivity():
-    page_title("Sensitivity analysis", "Re-runs the forecast across a range of growth-rate multipliers to see how robust the recommendation is.")
+    page_title("Sensitivity analysis", "Re-runs the forecast and optimization across a range of growth multipliers.")
     require_model()
 
     mmm, cfg = S("mmm"), S("cfg")
@@ -1624,7 +1622,7 @@ def page_sensitivity():
             s_con = shift_slider("sens_con", "Max shift (%)")
 
         if gmax < gmin:
-            st.error("Max must be ≥ min.")
+            st.error("Maximum multiplier must be at least the minimum.")
             st.stop()
         mults = [round(x, 4) for x in np.arange(gmin, gmax + gstep / 2, gstep)]
 
@@ -1711,9 +1709,9 @@ def page_sensitivity():
 # ===================================================================
 
 def page_backtest():
-    page_title("Backtest", "True holdout test. For each quarter the model is retrained on data up to the end of that quarter "
-               "with the quarter's outcomes hidden, then asked to predict the revenue the actual spend produced. "
-               "The forecast assumptions are rebuilt from data before the quarter, exactly as the Forecast page would have done at the time.")
+    page_title("Backtest", "Holdout validation. For each quarter the model is refitted on data through the end of that quarter "
+               "with the quarter's outcomes excluded from the likelihood; expected revenue under actual spend is then compared "
+               "with actual revenue. Forecast assumptions are rebuilt from data preceding the quarter.")
     require_model()
 
     cfg = S("cfg")
@@ -1732,16 +1730,15 @@ def page_backtest():
         b1, b2, b3 = st.columns([3, 1.4, 1], gap="medium", vertical_alignment="bottom")
         with b1:
             bt_qs = st.multiselect("Quarters to backtest", eligible, default=[eligible[-1]],
-                                   help="Each quarter is a separate retrain, so expect roughly the training time per quarter.")
+                                   help="Each quarter requires a separate model fit.")
         with b2:
             b_con = shift_slider("bt_con", "Max shift (%)")
         with b3:
             quick = st.toggle("Quick sampling", value=False, key="bt_quick",
-                              help="2 chains × 250 kept samples instead of the full settings. Faster, noisier. "
-                                   "Use full settings for the numbers you present.")
-        st.caption(f"Model: {min(cfg['n_chains'], 2) if quick else cfg['n_chains']} chains × "
-                   f"{min(cfg['n_keep'], 250) if quick else cfg['n_keep']} kept per retrain. "
-                   "The held-out weeks contribute their spend (adstock) but not their outcomes.")
+                              help="Fits with at most 2 chains × 250 draws. Reduces run time at the cost of posterior precision.")
+        st.caption(f"{min(cfg['n_chains'], 2) if quick else cfg['n_chains']} chains × "
+                   f"{min(cfg['n_keep'], 250) if quick else cfg['n_keep']} draws per fit. "
+                   "Held-out weeks contribute media inputs (adstock) but not outcomes.")
 
         if _btn("Run backtest", icon=":material/replay:", type="primary", disabled=not bt_qs):
             out = []
@@ -1751,7 +1748,7 @@ def page_backtest():
                         st.write(f"**{bt_q}**")
                         r = run_backtest(bt_q, national_df, cfg, b_con, quick, lambda m: st.write(m))
                         if r is None:
-                            st.warning(f"Skipping {bt_q}: not enough history before it.")
+                            st.warning(f"{bt_q} skipped: insufficient history.")
                             continue
                         out.append(r)
                     status.update(label="Backtest complete", state="complete", expanded=False)
@@ -1772,12 +1769,12 @@ def page_backtest():
 
         with card(f"card_bt_{j}"):
             card_title(f"Quarter {bt['quarter']}",
-                       f"Retrained on {bt['n_train_weeks']} weeks · {bt['n_holdout_weeks']} holdout weeks"
-                       + (" · quick sampling" if bt["quick"] else ""))
+                       f"Fitted on {bt['n_train_weeks']} weeks · {bt['n_holdout_weeks']} holdout weeks"
+                       + (" · reduced sampling" if bt["quick"] else ""))
             kpi_row([
                 {"label": "Predicted revenue (holdout)", "value": fmt_money(pred_q),
                  "delta": signed(t["bias"], suffix="%"), "delta_dir": "flat" if abs(t["bias"]) <= 5 else "down",
-                 "sub": "Given the spend that actually ran"},
+                 "sub": "Expected revenue under actual spend"},
                 {"label": "Actual revenue", "value": fmt_money(act_q), "sub": f"{bt['q_start']} → {bt['q_end']}"},
                 {"label": "Holdout wMAPE", "value": f"{t['wmape']:.1f}%", "sub": f"In-sample {tr['wmape']:.1f}%",
                  "bar": max(0.0, 1 - t["wmape"] / 50), "bar_color": GREEN if good else PINK},
@@ -1805,7 +1802,7 @@ def page_backtest():
 
             c1, c2 = st.columns([1.4, 1], gap="medium")
             with c1:
-                md('<div class="ctitle"><h3>Forecast assumptions vs actual</h3><span class="hint">Built from data before the quarter</span></div>')
+                md('<div class="ctitle"><h3>Forecast assumptions vs actual</h3><span class="hint">From data preceding the quarter</span></div>')
                 fc = bt["fc"]
                 def _err(f, a):
                     return signed((f - a) / a * 100, suffix="%") if a else "—"
@@ -1823,14 +1820,13 @@ def page_backtest():
                           "Error": _err(fc["controls"][c], bt["actual_controls"][c])} for c in cfg.get("control_cols", [])]
                 table(rows, right={"Forecast", "Actual", "Error"})
             with c2:
-                md('<div class="ctitle"><h3>What the model would have recommended</h3>'
-                   '<span class="hint">Reference only — not scorable</span></div>')
+                md('<div class="ctitle"><h3>Recommended allocation</h3>'
+                   '<span class="hint">Reference; not validated against outcomes</span></div>')
                 rows = [{"Channel": ch, "Status quo": f"{bt['sq_pct'][i]:.1f}%", "Recommended": f"{bt['opt_pct'][i]:.1f}%",
                          "Actual": f"{bt['actual_pct'][ch] * 100:.1f}%"} for i, ch in enumerate(channels)]
                 table(rows, right={"Status quo", "Recommended", "Actual"})
-                st.caption(f"Recommendation held within {constraint_label(bt['constraint'])} of status quo. "
-                           "Nobody observed what this mix would have earned, so it cannot be checked against reality; "
-                           "the revenue test above is the evidence the model works.")
+                st.caption(f"Allocation constrained to {constraint_label(bt['constraint'])} of status quo. "
+                           "The outcome of this allocation is counterfactual and unobserved.")
 
         summary.append({"Quarter": bt["quarter"], "Predicted": fmt_money(pred_q), "Actual": fmt_money(act_q),
                         "Bias": signed(t["bias"], suffix="%"), "wMAPE": f"{t['wmape']:.1f}%",
@@ -1841,10 +1837,9 @@ def page_backtest():
             card_title("Summary", "Holdout accuracy per quarter")
             table(summary, right={"Predicted", "Actual", "Bias", "wMAPE", "MAPE", "R²", "In-sample wMAPE"})
 
-    st.caption("How to read this: wMAPE is the total absolute weekly error as a share of actual revenue; bias is whether "
-               "the quarter total ran high or low. A holdout wMAPE close to the in-sample figure means the model "
-               "generalises; a large gap means it is fitting noise. Consistent bias in one direction across quarters "
-               "points at the trend or baseline, not the media curves.")
+    st.caption("wMAPE: sum of absolute weekly errors over actual revenue. Bias: predicted minus actual quarter revenue "
+               "as a share of actual. R²: computed on weekly values within the window. In-sample figures cover the "
+               "training weeks of the same fit.")
 
 
 # ===================================================================
@@ -1852,7 +1847,7 @@ def page_backtest():
 # ===================================================================
 
 def page_trends():
-    page_title("Quarterly trends", "Complete quarters only — partial first/last quarters are excluded.")
+    page_title("Quarterly trends", "Complete quarters only; partial first and last quarters are excluded.")
     require_model()
 
     cfg = S("cfg")
@@ -1873,7 +1868,7 @@ def page_trends():
     tm = S("trend_multipliers") or {}
 
     with card("card_tr_kpis"):
-        card_title("Growth multipliers", "Mean year-over-year rate per variable, used for forecasting")
+        card_title("Growth multipliers", "Mean year-over-year rate per variable")
         items = []
         for ch in channels[:3]:
             g = tm.get(f"{ch}_spend", 1.0)
