@@ -36,7 +36,8 @@ national.
 ## Method
 
 - **Model**: Meridian national MMM with adstock and Hill saturation per channel,
-  a log-normal ROI prior, user-supplied controls, and generated yearly Fourier
+  a log-normal ROAS prior (incremental revenue over spend, Meridian's "ROI"),
+  user-supplied controls, and generated yearly Fourier
   terms as seasonal controls.
 - **Forecast layer**: next-quarter inputs are the same quarter of the prior year
   scaled by growth multipliers. Each multiplier is the geometric mean of the

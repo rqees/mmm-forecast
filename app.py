@@ -532,9 +532,13 @@ def build_forecast_config(df, trend_multipliers, cfg, corresponding_quarter):
     naive_ctl = {c: float(base[c].mean()) for c in cfg["control_cols"]}
 
     g = lambda k: trend_multipliers.get(k, 1.0)
+    # total budget grows at the spend-weighted average of the channel growth rates,
+    # so a small channel's trend cannot swing the total
+    spend_growth = float(sum(base[f"{ch}{cfg['spend_suffix']}"].sum() * g(f"{ch}_spend") for ch in channels) / naive_budget)
     return {
         "n_baseline_weeks": len(base),
-        "total_budget": naive_budget * float(np.mean([g(f"{ch}_spend") for ch in channels])),
+        "total_budget": naive_budget * spend_growth,
+        "spend_growth": spend_growth,
         "total_budget_naive": naive_budget,
         "spend_pct": {ch: float(p) for ch, p in zip(channels, naive_pct)},
         "cost_per_impression": {ch: naive_cpi[ch] * g(f"{ch}_cpi") for ch in channels},
@@ -1088,7 +1092,7 @@ def show_error(msg, exc=True):
 # ===================================================================
 
 def page_config():
-    page_title("Configuration", "Upload weekly data, map columns and train the model, or load a saved model.")
+    page_title("Configuration")
 
     trained = model_ready()
 
@@ -1144,7 +1148,6 @@ def page_config():
 
         up_df = S("uploaded_df")
         if up_df is None:
-            st.caption("Accepts wide (one row per week) or long (one row per week × channel) layouts.")
             st.stop()
 
         st.caption(f"{up_df.shape[0]:,} rows × {up_df.shape[1]} columns")
@@ -1172,9 +1175,6 @@ def page_config():
         lc0, lc1 = st.columns([1, 3], gap="medium")
         with lc0:
             layout = st.segmented_control("Data layout", ["Wide", "Long"], default=lay_default, key="layout_mode") or lay_default
-        with lc1:
-            st.caption("**Wide**: one row per week, channels as columns (search_spend, search_impression, …).  \n"
-                       "**Long**: one row per week × channel (e.g. week, channel, cost, impr).")
 
         if layout == "Long":
             def _idx(name, fallback=0):
@@ -1324,9 +1324,9 @@ def page_config():
         card_title("Model settings", step=3)
         ms1, ms2, ms3, ms4 = st.columns(4)
         with ms1:
-            roi_mu = st.number_input("ROI prior μ (log-normal)", value=0.2, step=0.1, format="%.2f")
+            roi_mu = st.number_input("ROAS prior μ (log-normal)", value=0.2, step=0.1, format="%.2f")
         with ms2:
-            roi_sigma = st.number_input("ROI prior σ", value=0.9, min_value=0.05, step=0.1, format="%.2f")
+            roi_sigma = st.number_input("ROAS prior σ", value=0.9, min_value=0.05, step=0.1, format="%.2f")
         with ms3:
             n_future_weeks = st.number_input("Forecast horizon (weeks)", value=13, min_value=1, max_value=52)
         with ms4:
@@ -1417,7 +1417,7 @@ def page_config():
     # ---- 5. Save ----
     if trained:
         with card("card_save"):
-            card_title("Save model", "Writes the model (.binpb) and a configuration JSON alongside it", step=5)
+            card_title("Save model", step=5)
             if not os.path.isdir("/content/drive/MyDrive") and os.path.isdir("/content"):
                 st.warning("Google Drive is not mounted. Files saved to the runtime are lost when it disconnects.")
             sc1, sc2 = st.columns([4, 1], vertical_alignment="bottom")
@@ -1440,7 +1440,7 @@ def page_config():
 # ===================================================================
 
 def page_forecast():
-    page_title("Forecast & optimize", "Projects the selected quarter from same-quarter-prior-year actuals and growth multipliers, then optimizes the channel allocation.")
+    page_title("Forecast & optimize")
     require_model()
 
     mmm, cfg = S("mmm"), S("cfg")
@@ -1472,13 +1472,12 @@ def page_forecast():
             st.error(f"No usable baseline data for {corr_label}.")
             st.stop()
 
-        st.caption(f"Baseline: **{corr_label}** actuals ({base['n_baseline_weeks']} weeks) × growth multipliers × {growth_mult:.2f}")
 
     # ---- Assumptions ----
     wk = f"{forecast_q}_{growth_mult:.2f}"  # inputs keyed on (quarter, growth) so they reset when either changes
     with card("card_fc_params"):
         card_title("Assumptions", f"Defaults from {corr_label}")
-        spend_g = float(np.mean([adj_trends.get(f"{ch}_spend", 1.0) for ch in channels]))
+        spend_g = base["spend_growth"]
         kpi_row([
             {"label": "Budget", "value": fmt_money(base["total_budget"]),
              "delta": fmt_growth(spend_g), "delta_dir": "up" if spend_g >= 1 else "down",
@@ -1574,7 +1573,7 @@ def page_forecast():
              "bar": r["op_total"] / max(r["op_total"], r["sq_total"], 1e-9), "bar_color": GREEN},
             {"label": "Gain from reallocation", "value": fmt_money(r["gain"]),
              "delta": f"{gp:+.1f}%", "delta_dir": "up" if r["gain"] > 0 else ("down" if r["gain"] < 0 else "flat")},
-            {"label": "Blended ROI", "value": f"{r['op_total'] / r['budget']:.2f}x" if r["budget"] else "—",
+            {"label": "Blended ROAS", "value": f"{r['op_total'] / r['budget']:.2f}x" if r["budget"] else "—",
              "sub": f"Status quo {r['sq_total'] / r['budget']:.2f}x" if r["budget"] else ""},
         ])
 
@@ -1595,9 +1594,9 @@ def page_forecast():
                              "Status quo": H(f"{sq:.1f}% <span class='muted'>({fmt_money(r['sq_spend'][i])})</span>"),
                              "Optimized": H(f"{op:.1f}% <span class='muted'>({fmt_money(r['op_spend'][i])})</span>"),
                              "Change": signed(op - sq, suffix=" pp"),
-                             "SQ ROI": f"{r['sq_roi'][i]:.2f}",
-                             "Opt ROI": f"{r['op_roi'][i]:.2f}"})
-            table(rows, right={"Status quo", "Optimized", "Change", "SQ ROI", "Opt ROI"})
+                             "SQ ROAS": f"{r['sq_roi'][i]:.2f}",
+                             "Opt ROAS": f"{r['op_roi'][i]:.2f}"})
+            table(rows, right={"Status quo", "Optimized", "Change", "SQ ROAS", "Opt ROAS"})
 
     div, unit = money_scale(r["sq_rev"], r["op_rev"])
     c1, c2, c3 = st.columns(3, gap="medium")
@@ -1611,8 +1610,8 @@ def page_forecast():
             _plot(_bar_pair(channels, r["sq_rev"] / div, r["op_rev"] / div, unit))
     with c3:
         with card("card_fc_ch3"):
-            card_title("Return on investment", "ROI")
-            _plot(_bar_pair(channels, r["sq_roi"], r["op_roi"], "ROI"))
+            card_title("Return on ad spend", "ROAS")
+            _plot(_bar_pair(channels, r["sq_roi"], r["op_roi"], "ROAS"))
 
 
 # ===================================================================
@@ -1620,7 +1619,7 @@ def page_forecast():
 # ===================================================================
 
 def page_backtest():
-    page_title("Backtest", "Holdout validation by quarter.")
+    page_title("Backtest")
     require_model()
 
     cfg = S("cfg")
