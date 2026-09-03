@@ -1070,7 +1070,7 @@ def page_config():
     top_l, top_r = st.columns([3, 2], gap="medium")
     with top_l:
         with card("card_status"):
-            card_title("Model status", "Held in session memory for the current runtime")
+            card_title("Model status")
             if trained:
                 _c, _n = S("cfg"), S("national_df")
                 tc = _c["time_col"]
@@ -1305,8 +1305,7 @@ def page_config():
             n_future_weeks = st.number_input("Forecast horizon (weeks)", value=13, min_value=1, max_value=52)
         with ms4:
             season_k = st.number_input("Seasonality harmonics", value=2, min_value=0, max_value=4,
-                                       help="Yearly sine/cosine terms added as control variables (0 = off). Each harmonic adds two "
-                                            "terms; 2 captures annual and semi-annual cycles. Generated from the time column.")
+                                       help="Yearly sine/cosine terms added as control variables (0 = off). Each harmonic adds two terms.")
         with st.expander("Sampling (MCMC)"):
             sm1, sm2, sm3, sm4 = st.columns(4)
             with sm1:
@@ -1447,8 +1446,7 @@ def page_forecast():
             st.error(f"No usable baseline data for {corr_label}.")
             st.stop()
 
-        st.caption(f"Baseline: **{corr_label}** actuals ({base['n_baseline_weeks']} weeks) × growth multipliers × {growth_mult:.2f}. "
-                   "Inputs below reset to these defaults when the quarter or growth multiplier changes.")
+        st.caption(f"Baseline: **{corr_label}** actuals ({base['n_baseline_weeks']} weeks) × growth multipliers × {growth_mult:.2f}")
 
     # ---- Assumptions ----
     wk = f"{forecast_q}_{growth_mult:.2f}"  # inputs keyed on (quarter, growth) so they reset when either changes
@@ -1709,9 +1707,7 @@ def page_sensitivity():
 # ===================================================================
 
 def page_backtest():
-    page_title("Backtest", "Holdout validation. For each quarter the model is refitted on data through the end of that quarter "
-               "with the quarter's outcomes excluded from the likelihood; expected revenue under actual spend is then compared "
-               "with actual revenue. Forecast assumptions are rebuilt from data preceding the quarter.")
+    page_title("Backtest", "Holdout validation by quarter.")
     require_model()
 
     cfg = S("cfg")
@@ -1729,16 +1725,12 @@ def page_backtest():
         card_title("Backtest setup")
         b1, b2, b3 = st.columns([3, 1.4, 1], gap="medium", vertical_alignment="bottom")
         with b1:
-            bt_qs = st.multiselect("Quarters to backtest", eligible, default=[eligible[-1]],
-                                   help="Each quarter requires a separate model fit.")
+            bt_qs = st.multiselect("Quarters to backtest", eligible, default=[eligible[-1]])
         with b2:
             b_con = shift_slider("bt_con", "Max shift (%)")
         with b3:
             quick = st.toggle("Quick sampling", value=False, key="bt_quick",
-                              help="Fits with at most 2 chains × 250 draws. Reduces run time at the cost of posterior precision.")
-        st.caption(f"{min(cfg['n_chains'], 2) if quick else cfg['n_chains']} chains × "
-                   f"{min(cfg['n_keep'], 250) if quick else cfg['n_keep']} draws per fit. "
-                   "Held-out weeks contribute media inputs (adstock) but not outcomes.")
+                              help="At most 2 chains × 250 draws.")
 
         if _btn("Run backtest", icon=":material/replay:", type="primary", disabled=not bt_qs):
             out = []
@@ -1820,13 +1812,11 @@ def page_backtest():
                           "Error": _err(fc["controls"][c], bt["actual_controls"][c])} for c in cfg.get("control_cols", [])]
                 table(rows, right={"Forecast", "Actual", "Error"})
             with c2:
-                md('<div class="ctitle"><h3>Recommended allocation</h3>'
-                   '<span class="hint">Reference; not validated against outcomes</span></div>')
+                md(f'<div class="ctitle"><h3>Recommended allocation</h3>'
+                   f'<span class="hint">{constraint_label(bt["constraint"])} max shift</span></div>')
                 rows = [{"Channel": ch, "Status quo": f"{bt['sq_pct'][i]:.1f}%", "Recommended": f"{bt['opt_pct'][i]:.1f}%",
                          "Actual": f"{bt['actual_pct'][ch] * 100:.1f}%"} for i, ch in enumerate(channels)]
                 table(rows, right={"Status quo", "Recommended", "Actual"})
-                st.caption(f"Allocation constrained to {constraint_label(bt['constraint'])} of status quo. "
-                           "The outcome of this allocation is counterfactual and unobserved.")
 
         summary.append({"Quarter": bt["quarter"], "Predicted": fmt_money(pred_q), "Actual": fmt_money(act_q),
                         "Bias": signed(t["bias"], suffix="%"), "wMAPE": f"{t['wmape']:.1f}%",
@@ -1837,9 +1827,6 @@ def page_backtest():
             card_title("Summary", "Holdout accuracy per quarter")
             table(summary, right={"Predicted", "Actual", "Bias", "wMAPE", "MAPE", "R²", "In-sample wMAPE"})
 
-    st.caption("wMAPE: sum of absolute weekly errors over actual revenue. Bias: predicted minus actual quarter revenue "
-               "as a share of actual. R²: computed on weekly values within the window. In-sample figures cover the "
-               "training weeks of the same fit.")
 
 
 # ===================================================================
