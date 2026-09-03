@@ -39,9 +39,26 @@ national.
   a log-normal ROI prior, user-supplied controls, and generated yearly Fourier
   terms as seasonal controls.
 - **Forecast layer**: next-quarter inputs are the same quarter of the prior year
-  scaled by growth multipliers, the median year-over-year ratio per variable capped
-  to [0.5, 2.0].
+  scaled by growth multipliers. Each multiplier is the geometric mean of the
+  variable's same-quarter year-over-year ratios, with every ratio winsorized to
+  [0.5, 2.0]. With fewer than two years of complete quarters all multipliers are 1.0.
 - **Optimizer**: Meridian budget optimizer at fixed total budget with symmetric
   per-channel bounds up to 100%, and lower bound zero above that.
 - **Validation**: per-quarter holdout via Meridian `holdout_id`, reporting wMAPE,
   MAPE, bias, and R² on the held-out weeks against in-sample values.
+
+## Limitations
+
+- **National only.** Geos are aggregated before training and population is unused.
+  A geo-level model is the natural next step and Meridian supports it directly.
+- **Forecast-layer inputs are point estimates.** The MMM carries posterior
+  uncertainty, but the growth multipliers, prior-year baseline, and cost per
+  impression do not. Uncertainty in the recommendation from those inputs is not
+  propagated; the growth multiplier slider on the Forecast page is a manual
+  sensitivity check, not a distribution.
+- **Few year-over-year observations.** With two years of data each variable has at
+  most four ratios behind its multiplier, which is why they are winsorized.
+- **Flat baseline plus Fourier seasonality.** The national baseline is a single
+  level with generated seasonal terms; it has no trend component of its own.
+- **Fixed budget.** The optimizer reallocates a given total. It does not choose the
+  total, for example by growing spend until marginal ROI reaches a target.

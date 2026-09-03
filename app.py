@@ -438,15 +438,20 @@ def validate_national(df, cfg):
     return errors, warns
 
 
-TREND_MIN, TREND_MAX = 0.5, 2.0  # growth multipliers are capped at halving / doubling year over year
+TREND_MIN, TREND_MAX = 0.5, 2.0  # each year-over-year ratio is winsorized to halving / doubling
 
 
 def compute_trend_multipliers(df, cfg):
-    """Per-variable growth multipliers from complete quarters only: the median of
-    year-over-year ratios (quarter-over-quarter if fewer than two years), capped
-    to [TREND_MIN, TREND_MAX]. The median and cap keep one anomalous quarter on a
-    small channel from producing an extreme multiplier. Returns (multipliers,
-    quarterly_df). Multipliers are all 1.0 if there isn't enough history."""
+    """Per-variable growth multipliers from complete quarters only.
+
+    For each variable, every same-quarter year-over-year ratio in the data is
+    winsorized to [TREND_MIN, TREND_MAX] and the geometric mean is taken (rates
+    compound, so the geometric mean is the appropriate estimator; the cap keeps
+    a near-zero denominator or one anomalous quarter on a small channel from
+    dominating). With fewer than two years of complete quarters no year-over-year
+    ratio exists and all multipliers are 1.0: quarter-over-quarter ratios are not
+    used because they mix seasonality into the growth estimate.
+    Returns (multipliers, quarterly_df)."""
     channels = cfg["channels"]
     tcol = cfg["time_col"]
     variables = (
@@ -481,22 +486,20 @@ def compute_trend_multipliers(df, cfg):
         rows.append(r)
     qdf = pd.DataFrame(rows).sort_values("quarter").reset_index(drop=True)
 
-    if len(qdf) < 2:
+    if qdf["year"].nunique() < 2:
         return neutral, qdf
 
-    use_yoy = qdf["year"].nunique() >= 2
     tm = {}
     for var in variables:
         rates = []
-        if use_yoy:
-            for qn in qdf["q_num"].unique():
-                vals = qdf[qdf["q_num"] == qn].sort_values("year")[var].values
-                rates += [vals[i] / vals[i - 1] for i in range(1, len(vals)) if vals[i - 1] > 0]
-        if not rates:  # fall back to quarter-over-quarter
-            vals = qdf[var].values
-            rates = [vals[i] / vals[i - 1] for i in range(1, len(vals)) if vals[i - 1] > 0]
-        m = float(np.median(rates)) if rates else 1.0
-        tm[var] = float(np.clip(m, TREND_MIN, TREND_MAX))
+        for qn in qdf["q_num"].unique():
+            vals = qdf[qdf["q_num"] == qn].sort_values("year")[var].values
+            rates += [vals[i] / vals[i - 1] for i in range(1, len(vals)) if vals[i - 1] > 0]
+        if not rates:
+            tm[var] = 1.0
+            continue
+        capped = np.clip(np.asarray(rates, dtype=float), TREND_MIN, TREND_MAX)
+        tm[var] = float(np.exp(np.mean(np.log(capped))))
     return tm, qdf
 
 
@@ -1374,7 +1377,7 @@ def page_config():
         kpi_row([
             {"label": "Weeks", "value": f"{len(candidate)}", "sub": f"{candidate[time_col].min()} → {candidate[time_col].max()}"},
             {"label": "Complete quarters", "value": f"{n_q}", "sub": geo_note,
-             "delta": "" if n_q >= 5 else "< 5, QoQ fallback", "delta_dir": "down"},
+             "delta": "" if n_q >= 8 else "< 2 years, no growth", "delta_dir": "down"},
             {"label": "Channels", "value": f"{len(channels)}", "sub": ", ".join(channels)},
             {"label": "Pre-flight", "value": "Ready" if not errors else f"{len(errors)} error{'s' if len(errors) > 1 else ''}",
              "delta": f"{len(warns)} warning{'s' if len(warns) != 1 else ''}" if warns else "",
@@ -1384,8 +1387,8 @@ def page_config():
             st.warning(w)
         for e in errors:
             st.error(e)
-        if n_q < 5:
-            st.caption("Fewer than 5 complete quarters: growth multipliers use quarter-over-quarter rates.")
+        if n_q < 8:
+            st.caption("Fewer than two years of complete quarters: no year-over-year ratios, so all growth multipliers are 1.0.")
 
         if _btn("Train model", icon=":material/rocket_launch:", type="primary", disabled=bool(errors)):
             st.session_state.national_df = candidate
@@ -1516,7 +1519,7 @@ def page_forecast():
 
         ctl = {}
         if cfg.get("control_cols"):
-            with st.expander("Control levels (held fixed)"):
+            with st.expander("Control levels"):
                 cols = st.columns(min(len(cfg["control_cols"]), 3))
                 for i, c in enumerate(cfg["control_cols"]):
                     with cols[i % len(cols)]:
