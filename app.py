@@ -19,7 +19,6 @@ import warnings
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
-from plotly.subplots import make_subplots
 import streamlit as st
 
 warnings.filterwarnings("ignore")
@@ -240,7 +239,6 @@ _DEFAULTS = dict(
     trend_multipliers=None,
     quarterly_df=None,
     last_results=None,
-    sensitivity_results=None,
     backtest_results=None,
 )
 for k, v in _DEFAULTS.items():
@@ -440,10 +438,15 @@ def validate_national(df, cfg):
     return errors, warns
 
 
+TREND_MIN, TREND_MAX = 0.5, 2.0  # growth multipliers are capped at halving / doubling year over year
+
+
 def compute_trend_multipliers(df, cfg):
-    """Per-variable growth multipliers from complete quarters only.
-    Returns (multipliers, quarterly_df). Multipliers are all 1.0 if there isn't
-    enough history to compute them."""
+    """Per-variable growth multipliers from complete quarters only: the median of
+    year-over-year ratios (quarter-over-quarter if fewer than two years), capped
+    to [TREND_MIN, TREND_MAX]. The median and cap keep one anomalous quarter on a
+    small channel from producing an extreme multiplier. Returns (multipliers,
+    quarterly_df). Multipliers are all 1.0 if there isn't enough history."""
     channels = cfg["channels"]
     tcol = cfg["time_col"]
     variables = (
@@ -492,7 +495,8 @@ def compute_trend_multipliers(df, cfg):
         if not rates:  # fall back to quarter-over-quarter
             vals = qdf[var].values
             rates = [vals[i] / vals[i - 1] for i in range(1, len(vals)) if vals[i - 1] > 0]
-        tm[var] = float(np.mean(rates)) if rates else 1.0
+        m = float(np.median(rates)) if rates else 1.0
+        tm[var] = float(np.clip(m, TREND_MIN, TREND_MAX))
     return tm, qdf
 
 
@@ -719,7 +723,7 @@ def accuracy_metrics(pred, act):
     return dict(mape=mape, wmape=wmape, bias=bias, r2=r2)
 
 
-def run_backtest(bt_q, national_df, cfg, constraint, quick, log):
+def run_backtest(bt_q, national_df, cfg, quick, log):
     """True holdout backtest for one quarter.
 
     1. Keep only data up to the end of `bt_q`; nothing after it exists.
@@ -730,8 +734,6 @@ def run_backtest(bt_q, national_df, cfg, constraint, quick, log):
     4. Forecast-layer test — trend multipliers and the same-quarter-last-year
        baseline are computed from data strictly before the quarter, exactly as
        the Forecast page would have at the time, and compared with what happened.
-    5. Reference — what the held-out model would have recommended. This cannot
-       be scored: nobody observed what the recommended mix would have earned.
     """
     deps = _load_deps()
     channels, tcol = cfg["channels"], cfg["time_col"]
@@ -786,10 +788,6 @@ def run_backtest(bt_q, national_df, cfg, constraint, quick, log):
     a_rpk = float((actual[cfg["kpi_col"]] * actual[cfg["rev_per_kpi_col"]]).sum() / a_kpi) if a_kpi > 0 else 0.0
     a_ctl = {c: float(actual[c].mean()) for c in cfg.get("control_cols", [])}
 
-    # Reference: recommendation from the held-out model
-    log("Running optimizer")
-    res = run_optimizer(mmm_bt, fc, cfg, constraint, last_date=dt.max())
-
     return {
         "quarter": bt_q, "q_start": q_start, "q_end": q_end,
         "n_train_weeks": int((~mask).sum()), "n_holdout_weeks": int(mask.sum()),
@@ -800,9 +798,6 @@ def run_backtest(bt_q, national_df, cfg, constraint, quick, log):
         "train": accuracy_metrics(pred_mean[~mask], act_rev[~mask]),
         "fc": fc,
         "actual_budget": a_budget, "actual_pct": a_pct, "actual_cpi": a_cpi, "actual_rpk": a_rpk, "actual_controls": a_ctl,
-        "sq_pct": res.nonoptimized_data.pct_of_spend.values * 100,
-        "opt_pct": res.optimized_data.pct_of_spend.values * 100,
-        "constraint": constraint,
     }
 
 
@@ -818,6 +813,32 @@ def default_save_dir():
     return os.getcwd()
 
 
+def _jsonable(obj):
+    """Recursively convert numpy containers/scalars so json.dump accepts the object."""
+    if isinstance(obj, dict):
+        return {str(k): _jsonable(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_jsonable(v) for v in obj]
+    if isinstance(obj, np.ndarray):
+        return obj.tolist()
+    if isinstance(obj, (np.floating, np.integer)):
+        return obj.item()
+    if isinstance(obj, np.bool_):
+        return bool(obj)
+    return obj
+
+
+def _restore_arrays(obj):
+    """Inverse of _jsonable for result dicts: lists of numbers/bools become numpy arrays."""
+    if isinstance(obj, dict):
+        return {k: _restore_arrays(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        if obj and all(isinstance(v, (bool, int, float)) for v in obj):
+            return np.array(obj)
+        return [_restore_arrays(v) for v in obj]
+    return obj
+
+
 def save_bundle(path):
     deps = _load_deps()
     deps["serde"].save_meridian(S("mmm"), path)
@@ -827,6 +848,8 @@ def save_bundle(path):
     export["national_data"] = json.loads(S("national_df").to_json(orient="records", date_format="iso"))
     export["trend_multipliers"] = S("trend_multipliers")
     export["quarterly_data"] = json.loads(S("quarterly_df").to_json(orient="records"))
+    export["last_results"] = _jsonable(S("last_results"))
+    export["backtest_results"] = _jsonable(S("backtest_results"))
     with open(cfg_path, "w") as f:
         json.dump(export, f)
     return cfg_path
@@ -856,8 +879,8 @@ def load_bundle(path):
     st.session_state.national_df = ndf
     st.session_state.trend_multipliers = saved["trend_multipliers"]
     st.session_state.quarterly_df = pd.DataFrame(saved["quarterly_data"])
-    for k in ("last_results", "sensitivity_results", "backtest_results"):
-        st.session_state[k] = None
+    st.session_state.last_results = _restore_arrays(saved.get("last_results"))
+    st.session_state.backtest_results = _restore_arrays(saved.get("backtest_results"))
 
 
 
@@ -1281,17 +1304,10 @@ def page_config():
 
         used = {time_col, kpi_col, rpk_col, geo_col} | {f"{ch}{imp_suffix}" for ch in channels} | {f"{ch}{spend_suffix}" for ch in channels}
         remaining = [c for c in all_cols if c not in used and pd.api.types.is_numeric_dtype(raw_df[c])]
-        rm1, rm2, rm3 = st.columns(3)
-        with rm1:
-            non_media_cols = st.multiselect("Non-media treatment columns", remaining, key="m_nm",
-                                            help="Treatments under the advertiser's control, e.g. price or promotion depth. An incremental effect is estimated.")
-        with rm2:
-            organic_cols = st.multiselect("Organic media columns", [c for c in remaining if c not in non_media_cols], key="m_org")
-        with rm3:
-            control_cols = st.multiselect("Control columns", [c for c in remaining if c not in non_media_cols and c not in organic_cols],
-                                          key="m_ctl", help="External covariates, e.g. Google query volume, weather, macro indices. "
-                                                            "Included as controls; no incremental effect is estimated.")
-        organic_names = [c[:-len(imp_suffix)] if c.endswith(imp_suffix) else c for c in organic_cols]
+        non_media_cols, organic_cols, organic_names = [], [], []  # not exposed in the UI; pipeline support retained
+        control_cols = st.multiselect("Control columns", remaining, key="m_ctl",
+                                      help="External covariates, e.g. Google query volume, weather, macro indices. "
+                                           "Included as controls; no incremental effect is estimated.")
 
     # ---- 3. Model settings ----
     with card("card_settings"):
@@ -1377,7 +1393,7 @@ def page_config():
                     mmm = train_model(candidate, cfg, lambda m: st.write(m))
                     st.session_state.mmm = mmm
                     st.session_state.model_trained = True
-                    for k in ("last_results", "sensitivity_results", "backtest_results"):
+                    for k in ("last_results", "backtest_results"):
                         st.session_state[k] = None
                     status.update(label="Model trained", state="complete", expanded=False)
                     ok = True
@@ -1590,120 +1606,7 @@ def page_forecast():
 
 
 # ===================================================================
-# PAGE 3: Sensitivity
-# ===================================================================
-
-def page_sensitivity():
-    page_title("Sensitivity analysis", "Re-runs the forecast and optimization across a range of growth multipliers.")
-    require_model()
-
-    mmm, cfg = S("mmm"), S("cfg")
-    national_df, trend_multipliers = S("national_df"), S("trend_multipliers")
-
-    fq_opts, fq_def = forecastable_quarters(national_df, cfg["time_col"])
-    if not fq_opts:
-        st.error("Need at least one complete quarter plus its same-quarter-last-year.")
-        st.stop()
-
-    with card("card_sens_setup"):
-        card_title("Sweep setup")
-        s1, s2, s3, s4, s5 = st.columns([1.2, 1, 1, 1, 1.4], gap="medium")
-        with s1:
-            sq_q = st.selectbox("Quarter", fq_opts, index=fq_def, key="sens_q")
-        with s2:
-            gmin = st.number_input("Min multiplier", value=0.8, min_value=0.1, step=0.05, format="%.2f")
-        with s3:
-            gmax = st.number_input("Max multiplier", value=1.3, min_value=0.1, step=0.05, format="%.2f")
-        with s4:
-            gstep = st.number_input("Step", value=0.05, min_value=0.01, step=0.01, format="%.2f")
-        with s5:
-            s_con = shift_slider("sens_con", "Max shift (%)")
-
-        if gmax < gmin:
-            st.error("Maximum multiplier must be at least the minimum.")
-            st.stop()
-        mults = [round(x, 4) for x in np.arange(gmin, gmax + gstep / 2, gstep)]
-
-        bc1, bc2 = st.columns([1, 4], vertical_alignment="center")
-        with bc1:
-            run = _btn("Run sweep", icon=":material/play_arrow:", type="primary")
-        with bc2:
-            st.caption(f"{len(mults)} optimizer runs")
-
-        if run:
-            corr = quarter_to_date_range(get_corresponding_quarter(sq_q))
-            prog = st.progress(0, text="Running…")
-            rows = []
-            try:
-                for i, gm in enumerate(mults):
-                    adj = {k: 1.0 + (v - 1.0) * gm for k, v in trend_multipliers.items()}
-                    fc = build_forecast_config(national_df, adj, cfg, corr)
-                    if fc is None:
-                        continue
-                    res = run_optimizer(mmm, fc, cfg, s_con)
-                    sr = float(res.nonoptimized_data.attrs["total_incremental_outcome"])
-                    op = float(res.optimized_data.attrs["total_incremental_outcome"])
-                    rows.append({"growth_multiplier": gm, "budget": fc["total_budget"],
-                                 "status_quo_revenue": sr, "optimized_revenue": op, "gain": op - sr,
-                                 "gain_pct": (op - sr) / sr * 100 if sr else 0})
-                    prog.progress((i + 1) / len(mults), text=f"{i + 1}/{len(mults)}")
-                st.session_state.sensitivity_results = {"quarter": sq_q, "df": pd.DataFrame(rows)}
-            except Exception as e:
-                show_error(f"Sensitivity failed: {e}")
-            prog.empty()
-
-    sr_ = S("sensitivity_results")
-    if not (sr_ and not sr_["df"].empty):
-        return
-
-    sdf = sr_["df"]
-    labels = [f"{g:.0%}" for g in sdf["growth_multiplier"]]
-    div, unit = money_scale(sdf["status_quo_revenue"].values, sdf["optimized_revenue"].values)
-    gdiv, gunit = money_scale(sdf["gain"].values)
-
-    with card("card_sens_kpis"):
-        card_title(f"Results — {sr_['quarter']}", f"{len(sdf)} runs · {constraint_label(s_con)} max shift")
-        gmin_i, gmax_i = sdf["gain"].idxmin(), sdf["gain"].idxmax()
-        kpi_row([
-            {"label": "Gain range", "value": f"{fmt_money(sdf['gain'].min())} – {fmt_money(sdf['gain'].max())}",
-             "sub": f"{sdf['gain_pct'].min():+.1f}% to {sdf['gain_pct'].max():+.1f}%"},
-            {"label": "Best case", "value": fmt_money(sdf.loc[gmax_i, "gain"]),
-             "delta": f"@ {sdf.loc[gmax_i, 'growth_multiplier']:.0%}", "delta_dir": "up"},
-            {"label": "Worst case", "value": fmt_money(sdf.loc[gmin_i, "gain"]),
-             "delta": f"@ {sdf.loc[gmin_i, 'growth_multiplier']:.0%}", "delta_dir": "down"},
-            {"label": "Budget range", "value": f"{fmt_money(sdf['budget'].min())} – {fmt_money(sdf['budget'].max())}"},
-        ])
-
-    c1, c2 = st.columns(2, gap="medium")
-    with c1:
-        with card("card_sens_ch1"):
-            card_title("Incremental revenue vs growth assumption", f"Revenue, {unit}")
-            fig = go.Figure()
-            fig.add_trace(go.Scatter(x=labels, y=sdf["status_quo_revenue"] / div, mode="lines+markers", name="Status quo",
-                                     line=dict(color=COLORS["sq"], width=2), marker=dict(size=6)))
-            fig.add_trace(go.Scatter(x=labels, y=sdf["optimized_revenue"] / div, mode="lines+markers", name="Optimized",
-                                     line=dict(color=COLORS["opt"], width=2), marker=dict(size=6),
-                                     fill="tonexty", fillcolor=_hex_rgba(GREEN, 0.10)))
-            fig.update_layout(xaxis_title="Growth multiplier", yaxis_title=unit)
-            _plot(style_fig(fig, height=340))
-    with c2:
-        with card("card_sens_ch2"):
-            card_title("Gain from reallocation", f"Gain, {gunit}")
-            fig = go.Figure(go.Bar(x=labels, y=sdf["gain"] / gdiv, marker_color=COLORS["gain"], name="Gain"))
-            fig.update_layout(xaxis_title="Growth multiplier", yaxis_title=gunit, bargap=0.4)
-            _round_bars(fig)
-            _plot(style_fig(fig, height=340, legend=False))
-
-    with card("card_sens_table"):
-        card_title("Runs")
-        rows = [{"Multiplier": l, "Budget": f"${b:,.0f}", "Status quo revenue": f"${s:,.0f}",
-                 "Optimized revenue": f"${o:,.0f}", "Gain": f"${g:,.0f}", "Gain %": signed(gp, suffix="%")}
-                for l, b, s, o, g, gp in zip(labels, sdf["budget"], sdf["status_quo_revenue"], sdf["optimized_revenue"], sdf["gain"], sdf["gain_pct"])]
-        table(rows, right={"Budget", "Status quo revenue", "Optimized revenue", "Gain", "Gain %"})
-
-
-# ===================================================================
-# PAGE 4: Backtest
+# PAGE 3: Backtest
 # ===================================================================
 
 def page_backtest():
@@ -1723,12 +1626,10 @@ def page_backtest():
 
     with card("card_bt_setup"):
         card_title("Backtest setup")
-        b1, b2, b3 = st.columns([3, 1.4, 1], gap="medium", vertical_alignment="bottom")
+        b1, b2 = st.columns([3, 1], gap="medium", vertical_alignment="bottom")
         with b1:
             bt_qs = st.multiselect("Quarters to backtest", eligible, default=[eligible[-1]])
         with b2:
-            b_con = shift_slider("bt_con", "Max shift (%)")
-        with b3:
             quick = st.toggle("Quick sampling", value=False, key="bt_quick",
                               help="At most 2 chains × 250 draws.")
 
@@ -1738,7 +1639,7 @@ def page_backtest():
                 try:
                     for bt_q in bt_qs:
                         st.write(f"**{bt_q}**")
-                        r = run_backtest(bt_q, national_df, cfg, b_con, quick, lambda m: st.write(m))
+                        r = run_backtest(bt_q, national_df, cfg, quick, lambda m: st.write(m))
                         if r is None:
                             st.warning(f"{bt_q} skipped: insufficient history.")
                             continue
@@ -1792,31 +1693,23 @@ def page_backtest():
             fig.update_layout(yaxis_title=f"Weekly revenue ({unit})")
             _plot(style_fig(fig, height=320))
 
-            c1, c2 = st.columns([1.4, 1], gap="medium")
-            with c1:
-                md('<div class="ctitle"><h3>Forecast assumptions vs actual</h3><span class="hint">From data preceding the quarter</span></div>')
-                fc = bt["fc"]
-                def _err(f, a):
-                    return signed((f - a) / a * 100, suffix="%") if a else "—"
-                rows = [{"Variable": "Budget", "Forecast": fmt_money(fc["total_budget"]),
-                         "Actual": fmt_money(bt["actual_budget"]), "Error": _err(fc["total_budget"], bt["actual_budget"])},
-                        {"Variable": "Revenue per KPI", "Forecast": f"${fc['rev_per_kpi']:,.2f}",
-                         "Actual": f"${bt['actual_rpk']:,.2f}", "Error": _err(fc["rev_per_kpi"], bt["actual_rpk"])}]
-                rows += [{"Variable": f"{ch} share", "Forecast": f"{fc['spend_pct'][ch] * 100:.1f}%",
-                          "Actual": f"{bt['actual_pct'][ch] * 100:.1f}%",
-                          "Error": signed((fc["spend_pct"][ch] - bt["actual_pct"][ch]) * 100, suffix=" pp")} for ch in channels]
-                rows += [{"Variable": f"{ch} CPI", "Forecast": f"{fc['cost_per_impression'][ch]:.6f}",
-                          "Actual": f"{bt['actual_cpi'][ch]:.6f}",
-                          "Error": _err(fc["cost_per_impression"][ch], bt["actual_cpi"][ch])} for ch in channels]
-                rows += [{"Variable": c, "Forecast": f"{fc['controls'][c]:.4f}", "Actual": f"{bt['actual_controls'][c]:.4f}",
-                          "Error": _err(fc["controls"][c], bt["actual_controls"][c])} for c in cfg.get("control_cols", [])]
-                table(rows, right={"Forecast", "Actual", "Error"})
-            with c2:
-                md(f'<div class="ctitle"><h3>Recommended allocation</h3>'
-                   f'<span class="hint">{constraint_label(bt["constraint"])} max shift</span></div>')
-                rows = [{"Channel": ch, "Status quo": f"{bt['sq_pct'][i]:.1f}%", "Recommended": f"{bt['opt_pct'][i]:.1f}%",
-                         "Actual": f"{bt['actual_pct'][ch] * 100:.1f}%"} for i, ch in enumerate(channels)]
-                table(rows, right={"Status quo", "Recommended", "Actual"})
+            md('<div class="ctitle"><h3>Forecast assumptions vs actual</h3><span class="hint">From data preceding the quarter</span></div>')
+            fc = bt["fc"]
+            def _err(f, a):
+                return signed((f - a) / a * 100, suffix="%") if a else "—"
+            rows = [{"Variable": "Budget", "Forecast": fmt_money(fc["total_budget"]),
+                     "Actual": fmt_money(bt["actual_budget"]), "Error": _err(fc["total_budget"], bt["actual_budget"])},
+                    {"Variable": "Revenue per KPI", "Forecast": f"${fc['rev_per_kpi']:,.2f}",
+                     "Actual": f"${bt['actual_rpk']:,.2f}", "Error": _err(fc["rev_per_kpi"], bt["actual_rpk"])}]
+            rows += [{"Variable": f"{ch} share", "Forecast": f"{fc['spend_pct'][ch] * 100:.1f}%",
+                      "Actual": f"{bt['actual_pct'][ch] * 100:.1f}%",
+                      "Error": signed((fc["spend_pct"][ch] - bt["actual_pct"][ch]) * 100, suffix=" pp")} for ch in channels]
+            rows += [{"Variable": f"{ch} CPI", "Forecast": f"{fc['cost_per_impression'][ch]:.6f}",
+                      "Actual": f"{bt['actual_cpi'][ch]:.6f}",
+                      "Error": _err(fc["cost_per_impression"][ch], bt["actual_cpi"][ch])} for ch in channels]
+            rows += [{"Variable": c, "Forecast": f"{fc['controls'][c]:.4f}", "Actual": f"{bt['actual_controls'][c]:.4f}",
+                      "Error": _err(fc["controls"][c], bt["actual_controls"][c])} for c in cfg.get("control_cols", [])]
+            table(rows, right={"Forecast", "Actual", "Error"})
 
         summary.append({"Quarter": bt["quarter"], "Predicted": fmt_money(pred_q), "Actual": fmt_money(act_q),
                         "Bias": signed(t["bias"], suffix="%"), "wMAPE": f"{t['wmape']:.1f}%",
@@ -1830,81 +1723,6 @@ def page_backtest():
 
 
 # ===================================================================
-# PAGE 5: Trends
-# ===================================================================
-
-def page_trends():
-    page_title("Quarterly trends", "Complete quarters only; partial first and last quarters are excluded.")
-    require_model()
-
-    cfg = S("cfg")
-    channels = cfg["channels"]
-    qdf = S("quarterly_df")
-    if qdf is None or qdf.empty:
-        st.warning("No complete quarters to show.")
-        st.stop()
-
-    quarters = qdf["quarter"].tolist()
-    organic = [c for c in cfg.get("organic_cols", []) if c in qdf.columns]
-    non_media = [c for c in cfg.get("non_media_cols", []) if c in qdf.columns]
-    controls = [c for c in cfg.get("control_cols", []) if c in qdf.columns]
-    panel4_cols, panel4_title = ((organic, "Organic media") if organic else
-                                 (non_media, "Non-media treatments") if non_media else (controls, "Controls"))
-
-    sdiv, sunit = money_scale(*[qdf[f"{ch}_spend"].values for ch in channels])
-    tm = S("trend_multipliers") or {}
-
-    with card("card_tr_kpis"):
-        card_title("Growth multipliers", "Mean year-over-year rate per variable")
-        items = []
-        for ch in channels[:3]:
-            g = tm.get(f"{ch}_spend", 1.0)
-            items.append({"label": f"{ch} spend", "value": fmt_growth(g), "delta_dir": "up" if g >= 1 else "down",
-                          "sub": f"CPI {fmt_growth(tm.get(f'{ch}_cpi', 1.0))}"})
-        g = tm.get("rev_per_kpi", 1.0)
-        items.append({"label": "Revenue per KPI", "value": fmt_growth(g), "sub": f"{len(quarters)} complete quarters"})
-        kpi_row(items)
-
-    with card("card_tr_chart"):
-        card_title("Spend, cost and revenue by quarter")
-        fig = make_subplots(rows=2, cols=2, vertical_spacing=0.16, horizontal_spacing=0.08,
-                            subplot_titles=("Spend by channel", "Cost per impression", "Revenue per KPI", panel4_title))
-        for i, ch in enumerate(channels):
-            c = PALETTE[i % len(PALETTE)]
-            fig.add_trace(go.Scatter(x=quarters, y=qdf[f"{ch}_spend"] / sdiv, mode="lines+markers", name=ch,
-                                     line=dict(color=c, width=2), marker=dict(size=5), legendgroup=ch), row=1, col=1)
-            fig.add_trace(go.Scatter(x=quarters, y=qdf[f"{ch}_cpi"], mode="lines+markers", name=ch,
-                                     line=dict(color=c, width=2), marker=dict(size=5), legendgroup=ch, showlegend=False), row=1, col=2)
-        fig.add_trace(go.Scatter(x=quarters, y=qdf["rev_per_kpi"], mode="lines+markers", name="Rev / KPI",
-                                 line=dict(color=INK, width=2), marker=dict(size=5), showlegend=False,
-                                 fill="tozeroy", fillcolor=_hex_rgba(INK, 0.05)), row=2, col=1)
-        for j, c in enumerate(panel4_cols):
-            fig.add_trace(go.Scatter(x=quarters, y=qdf[c], mode="lines+markers", name=c,
-                                     line=dict(color=PALETTE[(j + 3) % len(PALETTE)], width=2), marker=dict(size=5)), row=2, col=2)
-        if not panel4_cols:
-            fig.add_annotation(text="No organic, non-media or control columns", xref="x4", yref="y4", x=0.5, y=0.5, showarrow=False)
-
-        fig.update_yaxes(title_text=f"Spend ({sunit})", row=1, col=1)
-        fig.update_yaxes(title_text="CPI ($)", row=1, col=2)
-        fig.update_yaxes(title_text="$ / KPI", row=2, col=1)
-        fig.update_yaxes(title_text="Level (quarterly mean)", row=2, col=2)
-        style_fig(fig, height=680, unified=False)
-        fig.update_layout(margin=dict(t=60, b=40, l=48, r=12), legend=dict(y=1.08))
-        for ann in fig.layout.annotations:
-            ann.update(xanchor="left", x=0.54 if ann.x > 0.5 else 0.0)
-        _plot(fig)
-
-    e1, e2 = st.columns(2, gap="medium")
-    with e1:
-        with st.expander("Raw quarterly data"):
-            _df(qdf, hide_index=True)
-    with e2:
-        with st.expander("Growth multipliers used for forecasting"):
-            table([{"Variable": k, "Multiplier": f"{v:.3f}", "Growth": signed((v - 1) * 100, suffix="%")} for k, v in tm.items()],
-                  right={"Multiplier", "Growth"})
-
-
-# ===================================================================
 # Navigation (top bar)
 # ===================================================================
 
@@ -1912,9 +1730,7 @@ PAGE_CONFIG = st.Page(page_config, title="Configuration", url_path="configure", 
 PAGES = [
     PAGE_CONFIG,
     st.Page(page_forecast, title="Forecast", url_path="forecast"),
-    st.Page(page_sensitivity, title="Sensitivity", url_path="sensitivity"),
     st.Page(page_backtest, title="Backtest", url_path="backtest"),
-    st.Page(page_trends, title="Trends", url_path="trends"),
 ]
 
 st.logo(LOGO_SVG, size="large")
