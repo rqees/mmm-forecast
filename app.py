@@ -1304,10 +1304,17 @@ def page_config():
 
         used = {time_col, kpi_col, rpk_col, geo_col} | {f"{ch}{imp_suffix}" for ch in channels} | {f"{ch}{spend_suffix}" for ch in channels}
         remaining = [c for c in all_cols if c not in used and pd.api.types.is_numeric_dtype(raw_df[c])]
-        non_media_cols, organic_cols, organic_names = [], [], []  # not exposed in the UI; pipeline support retained
-        control_cols = st.multiselect("Control columns", remaining, key="m_ctl",
-                                      help="External covariates, e.g. Google query volume, weather, macro indices. "
-                                           "Included as controls; no incremental effect is estimated.")
+        rm1, rm2, rm3 = st.columns(3)
+        with rm1:
+            non_media_cols = st.multiselect("Non-media treatment columns", remaining, key="m_nm",
+                                            help="Treatments under the advertiser's control, e.g. price or promotion depth. An incremental effect is estimated.")
+        with rm2:
+            organic_cols = st.multiselect("Organic media columns", [c for c in remaining if c not in non_media_cols], key="m_org")
+        with rm3:
+            control_cols = st.multiselect("Control columns", [c for c in remaining if c not in non_media_cols and c not in organic_cols],
+                                          key="m_ctl", help="External covariates, e.g. Google query volume, weather, macro indices. "
+                                                            "Included as controls; no incremental effect is estimated.")
+        organic_names = [c[:-len(imp_suffix)] if c.endswith(imp_suffix) else c for c in organic_cols]
 
     # ---- 3. Model settings ----
     with card("card_settings"):
