@@ -1,0 +1,3 @@
+streamlit>=1.30.0
+google-meridian[and-cuda,schema]
+plotly>=5.18.0

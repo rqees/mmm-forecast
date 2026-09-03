@@ -1,0 +1,26 @@
+# Place this file at .streamlit/config.toml next to app.py (restart Streamlit after changes).
+# The app also injects its own CSS, so it still looks right without this file —
+# but this makes native widgets (buttons, inputs, sliders, dataframes) match the design.
+
+[theme]
+base = "light"
+primaryColor = "#131916"
+backgroundColor = "#FFFFFF"
+secondaryBackgroundColor = "#F3F5F3"
+textColor = "#131916"
+linkColor = "#0E7A33"
+font = "Inter, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif"
+headingFont = "Inter, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif"
+baseRadius = "0.75rem"
+buttonRadius = "0.6rem"
+borderColor = "#E4E8E5"
+dataframeBorderColor = "#E4E8E5"
+dataframeHeaderBackgroundColor = "#F3F5F3"
+showWidgetBorder = true
+chartCategoricalColors = ["#16B34A", "#A6DD0F", "#F0CF1C", "#E5335A", "#131916", "#1BB8B0", "#F28C1A", "#8B5CF6"]
+
+[client]
+toolbarMode = "minimal"
+
+[server]
+headless = true
