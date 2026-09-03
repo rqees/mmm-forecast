@@ -476,7 +476,7 @@ def compute_trend_multipliers(df, cfg):
         for ch in channels:
             ti = g[f"{ch}{cfg['impression_suffix']}"].sum()
             ts = g[f"{ch}{cfg['spend_suffix']}"].sum()
-            r[f"{ch}_spend"] = ts
+            r[f"{ch}_spend"] = ts / len(g)  # weekly rate, so 13- and 14-week quarters compare like for like
             r[f"{ch}_cpi"] = ts / ti if ti > 0 else 0
         for c in cfg["non_media_cols"] + cfg["organic_cols"] + cfg["control_cols"]:
             r[c] = g[c].mean()
