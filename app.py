@@ -578,9 +578,10 @@ def shift_slider(key, label="Max shift per channel (%)"):
                           f"{MAX_SHIFT_PCT}% is effectively unconstrained.") / 100
 
 
-def run_optimizer(mmm, fc, cfg, constraint=0.3):
+def run_optimizer(mmm, fc, cfg, constraint=0.3, last_date=None):
     deps = _load_deps()
-    last_date = pd.to_datetime(S("national_df")[cfg["time_col"]]).max()
+    if last_date is None:
+        last_date = pd.to_datetime(S("national_df")[cfg["time_col"]]).max()
     future, _ = build_future_data_tensors(fc, cfg, last_date)
     bo = deps["optimizer"].BudgetOptimizer(mmm)
     return bo.optimize(
@@ -615,7 +616,10 @@ def extract_results(res, fc, quarter, constraint):
 # Training
 # ---------------------------------------------------------------------------
 
-def train_model(national_df, cfg, log):
+def train_model(national_df, cfg, log, holdout_mask=None):
+    """Train a Meridian model. `holdout_mask` (bool array, one per week) marks weeks
+    whose KPI is excluded from the likelihood — Meridian still sees their media
+    (adstock carries over) but never their outcomes. Used by the backtest."""
     deps = _load_deps()
     channels = cfg["channels"]
     media_cols = [f"{ch}{cfg['impression_suffix']}" for ch in channels]
@@ -651,7 +655,11 @@ def train_model(national_df, cfg, log):
     prior = deps["prior_cls"](
         roi_m=deps["tfp"].distributions.LogNormal(cfg["roi_mu"], cfg["roi_sigma"], name=deps["constants"].ROI_M)
     )
-    mmm = deps["model_cls"](input_data=data, model_spec=deps["spec_cls"](prior=prior))
+    spec_kw = dict(prior=prior)
+    if holdout_mask is not None:
+        spec_kw["holdout_id"] = np.asarray(holdout_mask, dtype=bool)
+        log(f"Holding out {int(spec_kw['holdout_id'].sum())} of {len(spec_kw['holdout_id'])} weeks from the likelihood.")
+    mmm = deps["model_cls"](input_data=data, model_spec=deps["spec_cls"](**spec_kw))
 
     log(f"Sampling prior ({cfg['n_prior_samples']} samples)...")
     mmm.sample_prior(cfg["n_prior_samples"])
@@ -663,6 +671,109 @@ def train_model(national_df, cfg, log):
                          n_burnin=cfg["n_burnin"], n_keep=cfg["n_keep"], seed=cfg.get("seed", 42))
     log(f"Posterior sampled in {(time.time() - t0) / 60:.1f} min.")
     return mmm
+
+
+# ---------------------------------------------------------------------------
+# Backtest engine (true holdout)
+# ---------------------------------------------------------------------------
+
+def accuracy_metrics(pred, act):
+    pred, act = np.asarray(pred, float), np.asarray(act, float)
+    nz = act != 0
+    mape = float(np.mean(np.abs(pred[nz] - act[nz]) / np.abs(act[nz])) * 100) if nz.any() else float("nan")
+    denom = float(np.sum(np.abs(act)))
+    wmape = float(np.sum(np.abs(pred - act)) / denom * 100) if denom > 0 else float("nan")
+    bias = float((pred.sum() - act.sum()) / act.sum() * 100) if act.sum() != 0 else float("nan")
+    ss_tot = float(np.sum((act - act.mean()) ** 2))
+    r2 = float(1 - np.sum((pred - act) ** 2) / ss_tot) if ss_tot > 0 else float("nan")
+    return dict(mape=mape, wmape=wmape, bias=bias, r2=r2)
+
+
+def run_backtest(bt_q, national_df, cfg, constraint, quick, log):
+    """True holdout backtest for one quarter.
+
+    1. Keep only data up to the end of `bt_q`; nothing after it exists.
+    2. Retrain the MMM with that quarter's weeks marked as holdout: the model sees
+       the spend that ran (needed for adstock) but never the KPI.
+    3. Model test — predict weekly revenue for the holdout weeks from the actual
+       spend and compare with actual revenue.
+    4. Forecast-layer test — trend multipliers and the same-quarter-last-year
+       baseline are computed from data strictly before the quarter, exactly as
+       the Forecast page would have at the time, and compared with what happened.
+    5. Reference — what the held-out model would have recommended. This cannot
+       be scored: nobody observed what the recommended mix would have earned.
+    """
+    deps = _load_deps()
+    channels, tcol = cfg["channels"], cfg["time_col"]
+    sfx_s, sfx_i = cfg["spend_suffix"], cfg["impression_suffix"]
+    q_start, q_end = quarter_to_date_range(bt_q)
+    corr = quarter_to_date_range(get_corresponding_quarter(bt_q))
+
+    dt_all = pd.to_datetime(national_df[tcol])
+    upto = national_df[dt_all <= q_end].reset_index(drop=True)
+    dt = pd.to_datetime(upto[tcol])
+    mask = (dt >= q_start).values
+    hist, actual = upto[~mask], upto[mask]
+    if actual.empty or hist.empty:
+        return None
+
+    # Forecast layer from history only
+    bt_trends, _ = compute_trend_multipliers(hist, cfg)
+    fc = build_forecast_config(hist, bt_trends, cfg, corr)
+    if fc is None:
+        return None
+
+    bt_cfg = dict(cfg)
+    if quick:
+        bt_cfg.update(n_chains=min(cfg["n_chains"], 2), n_keep=min(cfg["n_keep"], 250),
+                      n_adapt=min(cfg["n_adapt"], 500), n_burnin=min(cfg["n_burnin"], 250))
+    log(f"Retraining on {len(upto)} weeks through {upto[tcol].max()} with {int(mask.sum())} holdout weeks...")
+    mmm_bt = train_model(upto, bt_cfg, log, holdout_mask=mask)
+
+    # Model test: expected revenue per week given the media that actually ran
+    log("Predicting holdout weeks...")
+    an = deps["analyzer"].Analyzer(mmm_bt)
+    eo = an.expected_outcome(aggregate_geos=True, aggregate_times=False, use_kpi=False)
+    eo = eo.numpy() if hasattr(eo, "numpy") else np.asarray(eo)
+    flat = eo.reshape(-1, eo.shape[-1])  # (chains*draws, n_times)
+    model_times = pd.to_datetime(mmm_bt.input_data.time.values).strftime("%Y-%m-%d").tolist()
+    dates = dt.dt.strftime("%Y-%m-%d").tolist()
+    order = [model_times.index(d) for d in dates]  # align model time axis to our frame
+    pred = flat[:, order]
+    pred_mean, pred_lo, pred_hi = pred.mean(0), np.percentile(pred, 5, axis=0), np.percentile(pred, 95, axis=0)
+    act_rev = (upto[cfg["kpi_col"]] * upto[cfg["rev_per_kpi_col"]]).values.astype(float)
+
+    # Forecast-layer test: assumptions vs actuals
+    spend_cols = [f"{ch}{sfx_s}" for ch in channels]
+    a_spend = actual[spend_cols].sum()
+    a_budget = float(a_spend.sum())
+    a_pct = {ch: float(a_spend[f"{ch}{sfx_s}"] / a_budget) if a_budget > 0 else 0.0 for ch in channels}
+    a_cpi = {}
+    for ch in channels:
+        ti = float(actual[f"{ch}{sfx_i}"].sum())
+        a_cpi[ch] = float(a_spend[f"{ch}{sfx_s}"] / ti) if ti > 0 else 0.0
+    a_kpi = float(actual[cfg["kpi_col"]].sum())
+    a_rpk = float((actual[cfg["kpi_col"]] * actual[cfg["rev_per_kpi_col"]]).sum() / a_kpi) if a_kpi > 0 else 0.0
+    a_ctl = {c: float(actual[c].mean()) for c in cfg.get("control_cols", [])}
+
+    # Reference: recommendation from the held-out model
+    log("Running optimizer on the held-out model...")
+    res = run_optimizer(mmm_bt, fc, cfg, constraint, last_date=dt.max())
+
+    return {
+        "quarter": bt_q, "q_start": q_start, "q_end": q_end,
+        "n_train_weeks": int((~mask).sum()), "n_holdout_weeks": int(mask.sum()),
+        "quick": bool(quick),
+        "dates": dates, "mask": mask, "actual_rev": act_rev,
+        "pred_mean": pred_mean, "pred_lo": pred_lo, "pred_hi": pred_hi,
+        "test": accuracy_metrics(pred_mean[mask], act_rev[mask]),
+        "train": accuracy_metrics(pred_mean[~mask], act_rev[~mask]),
+        "fc": fc,
+        "actual_budget": a_budget, "actual_pct": a_pct, "actual_cpi": a_cpi, "actual_rpk": a_rpk, "actual_controls": a_ctl,
+        "sq_pct": res.nonoptimized_data.pct_of_spend.values * 100,
+        "opt_pct": res.optimized_data.pct_of_spend.values * 100,
+        "constraint": constraint,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -1561,12 +1672,12 @@ def page_sensitivity():
 # ===================================================================
 
 def page_backtest():
-    page_title("Backtest", "For a past quarter: build the forecast using only data before that quarter, then compare the optimizer's "
-               "recommended allocation with what was actually spent. The model was trained on all data, so read this as a check "
-               "on the allocation logic, not a true out-of-sample test.")
+    page_title("Backtest", "True holdout test. For each quarter the model is retrained on data up to the end of that quarter "
+               "with the quarter's outcomes hidden, then asked to predict the revenue the actual spend produced. "
+               "The forecast assumptions are rebuilt from data before the quarter, exactly as the Forecast page would have done at the time.")
     require_model()
 
-    mmm, cfg = S("mmm"), S("cfg")
+    cfg = S("cfg")
     national_df = S("national_df")
     channels = cfg["channels"]
     tcol = cfg["time_col"]
@@ -1579,88 +1690,122 @@ def page_backtest():
 
     with card("card_bt_setup"):
         card_title("Backtest setup")
-        b1, b2 = st.columns([3, 1], gap="medium")
+        b1, b2, b3 = st.columns([3, 1.4, 1], gap="medium", vertical_alignment="bottom")
         with b1:
-            bt_qs = st.multiselect("Quarters to backtest", eligible, default=[eligible[-1]])
+            bt_qs = st.multiselect("Quarters to backtest", eligible, default=[eligible[-1]],
+                                   help="Each quarter is a separate retrain, so expect roughly the training time per quarter.")
         with b2:
             b_con = shift_slider("bt_con", "Max shift (%)")
+        with b3:
+            quick = st.toggle("Quick sampling", value=False, key="bt_quick",
+                              help="2 chains × 250 kept samples instead of the full settings. Faster, noisier. "
+                                   "Use full settings for the numbers you present.")
+        st.caption(f"Model: {min(cfg['n_chains'], 2) if quick else cfg['n_chains']} chains × "
+                   f"{min(cfg['n_keep'], 250) if quick else cfg['n_keep']} kept per retrain. "
+                   "The held-out weeks contribute their spend (adstock) but not their outcomes.")
 
         if _btn("Run backtest", icon=":material/replay:", type="primary", disabled=not bt_qs):
             out = []
-            dt = pd.to_datetime(national_df[tcol])
-            try:
-                for bt_q in bt_qs:
-                    bt_start, bt_end = quarter_to_date_range(bt_q)
-                    corr = quarter_to_date_range(get_corresponding_quarter(bt_q))
-
-                    hist = national_df[dt < bt_start]  # no peeking at the target quarter or later
-                    bt_trends, _ = compute_trend_multipliers(hist, cfg)
-                    fc = build_forecast_config(hist, bt_trends, cfg, corr)
-                    if fc is None:
-                        st.warning(f"Skipping {bt_q}: no baseline data.")
-                        continue
-
-                    with st.spinner(f"Backtesting {bt_q}…"):
-                        res = run_optimizer(mmm, fc, cfg, b_con)
-
-                    actual = national_df[(dt >= bt_start) & (dt <= bt_end)]
-                    spend_cols = [f"{ch}{cfg['spend_suffix']}" for ch in channels]
-                    actual_spend = float(actual[spend_cols].sum().sum())
-                    actual_pct = (actual[spend_cols].sum() / actual_spend * 100).values if actual_spend > 0 else np.zeros(len(channels))
-
-                    out.append({
-                        "quarter": bt_q, "n_actual_weeks": len(actual), "n_forecast_weeks": fc["n_future_weeks"],
-                        "actual_spend": actual_spend, "predicted_budget": fc["total_budget"],
-                        "sq_pct": res.nonoptimized_data.pct_of_spend.values * 100,
-                        "opt_pct": res.optimized_data.pct_of_spend.values * 100,
-                        "actual_pct": actual_pct,
-                    })
-                st.session_state.backtest_results = out
-            except Exception as e:
-                show_error(f"Backtest failed: {e}")
+            with st.status("Backtesting…", expanded=True) as status:
+                try:
+                    for bt_q in bt_qs:
+                        st.write(f"**{bt_q}**")
+                        r = run_backtest(bt_q, national_df, cfg, b_con, quick, lambda m: st.write(m))
+                        if r is None:
+                            st.warning(f"Skipping {bt_q}: not enough history before it.")
+                            continue
+                        out.append(r)
+                    status.update(label="Backtest complete", state="complete", expanded=False)
+                    st.session_state.backtest_results = out
+                except Exception as e:
+                    status.update(label="Backtest failed", state="error", expanded=True)
+                    show_error(f"Backtest failed: {e}")
 
     if not S("backtest_results"):
         return
 
     summary = []
     for j, bt in enumerate(S("backtest_results")):
-        # Compare weekly rates so a partial quarter isn't penalised for having fewer weeks
-        pred_wk = bt["predicted_budget"] / bt["n_forecast_weeks"]
-        act_wk = bt["actual_spend"] / bt["n_actual_weeks"] if bt["n_actual_weeks"] else 0
-        berr = abs(pred_wk - act_wk) / act_wk * 100 if act_wk > 0 else 0
-
-        rows, correct, errs = [], 0, []
-        for i, ch in enumerate(channels):
-            b, a, p = bt["sq_pct"][i], bt["actual_pct"][i], bt["opt_pct"][i]
-            ad = "↑" if a > b + 0.5 else ("↓" if a < b - 0.5 else "—")
-            pd_ = "↑" if p > b + 0.5 else ("↓" if p < b - 0.5 else "—")
-            hit = ad == pd_
-            correct += hit
-            errs.append(abs(p - a))
-            rows.append({"Channel": ch, "Baseline %": f"{b:.1f}", "Actual %": f"{a:.1f}", "Predicted %": f"{p:.1f}",
-                         "Actual dir": arrow(a - b), "Predicted dir": arrow(p - b),
-                         "Match": H('<span class="ok">✓</span>') if hit else H('<span class="bad">✗</span>')})
+        m = bt["mask"]
+        t, tr = bt["test"], bt["train"]
+        pred_q, act_q = float(bt["pred_mean"][m].sum()), float(bt["actual_rev"][m].sum())
+        good = t["wmape"] <= 15
 
         with card(f"card_bt_{j}"):
             card_title(f"Quarter {bt['quarter']}",
-                       f"Predicted ${pred_wk:,.0f}/wk vs actual ${act_wk:,.0f}/wk over {bt['n_actual_weeks']} weeks")
+                       f"Retrained on {bt['n_train_weeks']} weeks · {bt['n_holdout_weeks']} holdout weeks"
+                       + (" · quick sampling" if bt["quick"] else ""))
             kpi_row([
-                {"label": "Directional accuracy", "value": f"{correct}/{len(channels)}",
-                 "bar": correct / len(channels) if channels else 0, "bar_color": GREEN},
-                {"label": "Budget error (weekly rate)", "value": f"{berr:.1f}%",
-                 "delta_dir": "down" if berr > 15 else "up", "delta": "high" if berr > 15 else "ok"},
-                {"label": "Mean allocation error", "value": f"{np.mean(errs):.1f} pp"},
+                {"label": "Predicted revenue (holdout)", "value": fmt_money(pred_q),
+                 "delta": signed(t["bias"], suffix="%"), "delta_dir": "flat" if abs(t["bias"]) <= 5 else "down",
+                 "sub": "Given the spend that actually ran"},
+                {"label": "Actual revenue", "value": fmt_money(act_q), "sub": f"{bt['q_start']} → {bt['q_end']}"},
+                {"label": "Holdout wMAPE", "value": f"{t['wmape']:.1f}%", "sub": f"In-sample {tr['wmape']:.1f}%",
+                 "bar": max(0.0, 1 - t["wmape"] / 50), "bar_color": GREEN if good else PINK},
+                {"label": "Holdout R²", "value": f"{t['r2']:.2f}", "sub": f"In-sample {tr['r2']:.2f}"},
             ])
-            md('<div style="height:8px"></div>')
-            table(rows, right={"Baseline %", "Actual %", "Predicted %", "Actual dir", "Predicted dir", "Match"})
 
-        summary.append({"Quarter": bt["quarter"], "Directional": f"{correct}/{len(channels)}",
-                        "Budget error": f"{berr:.1f}%", "Alloc error": f"{np.mean(errs):.1f} pp"})
+            # Weekly predicted vs actual, last year of training + holdout
+            n_show = min(len(bt["dates"]), bt["n_holdout_weeks"] + 52)
+            sl = slice(len(bt["dates"]) - n_show, None)
+            x = bt["dates"][sl]
+            div, unit = money_scale(bt["actual_rev"][sl], bt["pred_hi"][sl])
+            fig = go.Figure()
+            fig.add_trace(go.Scatter(x=x + x[::-1], y=list(bt["pred_hi"][sl] / div) + list(bt["pred_lo"][sl] / div)[::-1],
+                                     fill="toself", fillcolor=_hex_rgba(GREEN, 0.12), line=dict(width=0),
+                                     hoverinfo="skip", name="90% interval"))
+            fig.add_trace(go.Scatter(x=x, y=bt["pred_mean"][sl] / div, mode="lines", name="Predicted",
+                                     line=dict(color=GREEN, width=2)))
+            fig.add_trace(go.Scatter(x=x, y=bt["actual_rev"][sl] / div, mode="lines+markers", name="Actual",
+                                     line=dict(color=INK, width=2), marker=dict(size=4)))
+            fig.add_vrect(x0=bt["q_start"], x1=bt["q_end"], fillcolor=_hex_rgba(INK, 0.04), line_width=0,
+                          annotation_text="holdout", annotation_position="top left",
+                          annotation_font=dict(size=11, color=LABEL))
+            fig.update_layout(yaxis_title=f"Weekly revenue ({unit})")
+            _plot(style_fig(fig, height=320))
+
+            c1, c2 = st.columns([1.4, 1], gap="medium")
+            with c1:
+                md('<div class="ctitle"><h3>Forecast assumptions vs actual</h3><span class="hint">Built from data before the quarter</span></div>')
+                fc = bt["fc"]
+                def _err(f, a):
+                    return signed((f - a) / a * 100, suffix="%") if a else "—"
+                rows = [{"Variable": "Budget", "Forecast": fmt_money(fc["total_budget"]),
+                         "Actual": fmt_money(bt["actual_budget"]), "Error": _err(fc["total_budget"], bt["actual_budget"])},
+                        {"Variable": "Revenue per KPI", "Forecast": f"${fc['rev_per_kpi']:,.2f}",
+                         "Actual": f"${bt['actual_rpk']:,.2f}", "Error": _err(fc["rev_per_kpi"], bt["actual_rpk"])}]
+                rows += [{"Variable": f"{ch} share", "Forecast": f"{fc['spend_pct'][ch] * 100:.1f}%",
+                          "Actual": f"{bt['actual_pct'][ch] * 100:.1f}%",
+                          "Error": signed((fc["spend_pct"][ch] - bt["actual_pct"][ch]) * 100, suffix=" pp")} for ch in channels]
+                rows += [{"Variable": f"{ch} CPI", "Forecast": f"{fc['cost_per_impression'][ch]:.6f}",
+                          "Actual": f"{bt['actual_cpi'][ch]:.6f}",
+                          "Error": _err(fc["cost_per_impression"][ch], bt["actual_cpi"][ch])} for ch in channels]
+                rows += [{"Variable": c, "Forecast": f"{fc['controls'][c]:.4f}", "Actual": f"{bt['actual_controls'][c]:.4f}",
+                          "Error": _err(fc["controls"][c], bt["actual_controls"][c])} for c in cfg.get("control_cols", [])]
+                table(rows, right={"Forecast", "Actual", "Error"})
+            with c2:
+                md('<div class="ctitle"><h3>What the model would have recommended</h3>'
+                   '<span class="hint">Reference only — not scorable</span></div>')
+                rows = [{"Channel": ch, "Status quo": f"{bt['sq_pct'][i]:.1f}%", "Recommended": f"{bt['opt_pct'][i]:.1f}%",
+                         "Actual": f"{bt['actual_pct'][ch] * 100:.1f}%"} for i, ch in enumerate(channels)]
+                table(rows, right={"Status quo", "Recommended", "Actual"})
+                st.caption(f"Recommendation held within {constraint_label(bt['constraint'])} of status quo. "
+                           "Nobody observed what this mix would have earned, so it cannot be checked against reality; "
+                           "the revenue test above is the evidence the model works.")
+
+        summary.append({"Quarter": bt["quarter"], "Predicted": fmt_money(pred_q), "Actual": fmt_money(act_q),
+                        "Bias": signed(t["bias"], suffix="%"), "wMAPE": f"{t['wmape']:.1f}%",
+                        "MAPE": f"{t['mape']:.1f}%", "R²": f"{t['r2']:.2f}", "In-sample wMAPE": f"{tr['wmape']:.1f}%"})
 
     if len(summary) > 1:
         with card("card_bt_summary"):
-            card_title("Summary")
-            table(summary, right={"Directional", "Budget error", "Alloc error"})
+            card_title("Summary", "Holdout accuracy per quarter")
+            table(summary, right={"Predicted", "Actual", "Bias", "wMAPE", "MAPE", "R²", "In-sample wMAPE"})
+
+    st.caption("How to read this: wMAPE is the total absolute weekly error as a share of actual revenue; bias is whether "
+               "the quarter total ran high or low. A holdout wMAPE close to the in-sample figure means the model "
+               "generalises; a large gap means it is fitting noise. Consistent bias in one direction across quarters "
+               "points at the trend or baseline, not the media curves.")
 
 
 # ===================================================================
