@@ -1457,6 +1457,8 @@ def page_forecast():
         card_title("Forecast setup")
         q1, q2, q3 = st.columns([1, 1, 1], gap="medium")
         with q1:
+            if "fc_q" not in st.session_state and S("last_results") and S("last_results").get("quarter") in fq_opts:
+                fq_def = fq_opts.index(S("last_results")["quarter"])  # after a load, open on the quarter the saved result is for
             forecast_q = st.selectbox("Forecast quarter", fq_opts, index=fq_def, key="fc_q")
         with q2:
             growth_mult = st.slider("Growth rate multiplier", 0.8, 1.3, 1.0, 0.01, key="fc_gm",
