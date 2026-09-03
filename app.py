@@ -561,6 +561,23 @@ def build_future_data_tensors(fc, cfg, last_date):
     return deps["analyzer"].DataTensors(**td), dates
 
 
+MAX_SHIFT_PCT = 500  # slider ceiling; at this level the optimizer is effectively unconstrained
+
+
+def constraint_label(c):
+    """Human-readable spend constraint. Below 100% it is symmetric (±c); above,
+    a channel may be cut to zero and grown by up to +c."""
+    return f"±{c:.0%}" if c < 1 else f"0 to +{c:.0%}"
+
+
+def shift_slider(key, label="Max shift per channel (%)"):
+    return st.slider(label, 5, MAX_SHIFT_PCT, 30, 5, key=key,
+                     help="How far the optimizer may move each channel from its status-quo spend. "
+                          "Up to 100% this is symmetric (a channel can shrink or grow by this much). "
+                          "Above 100% a channel can be cut to zero and grown by up to this much; "
+                          f"{MAX_SHIFT_PCT}% is effectively unconstrained.") / 100
+
+
 def run_optimizer(mmm, fc, cfg, constraint=0.3):
     deps = _load_deps()
     last_date = pd.to_datetime(S("national_df")[cfg["time_col"]]).max()
@@ -570,8 +587,8 @@ def run_optimizer(mmm, fc, cfg, constraint=0.3):
         new_data=future,
         budget=fc["total_budget"],
         pct_of_spend=list(fc["spend_pct"].values()),
-        spend_constraint_lower=constraint,
-        spend_constraint_upper=constraint,
+        spend_constraint_lower=min(constraint, 1.0),  # Meridian: lower bound is a fraction of spend, max 1.0 (= zero)
+        spend_constraint_upper=constraint,            # upper may exceed 1.0 (e.g. 3.0 = up to 4x current)
     )
 
 
@@ -1272,8 +1289,7 @@ def page_forecast():
             growth_mult = st.slider("Growth rate multiplier", 0.8, 1.3, 1.0, 0.01, key="fc_gm",
                                     help="Scales every trend. 1.0 = historical growth; 0.8 = 80% of it; 1.3 = 130%.")
         with q3:
-            constraint = st.slider("Max shift per channel (±%)", 5, 100, 30, 5, key="fc_con",
-                                   help="How far the optimizer may move each channel from its status-quo share.") / 100
+            constraint = shift_slider("fc_con")
 
         corr_label = get_corresponding_quarter(forecast_q)
         corr_quarter = quarter_to_date_range(corr_label)
@@ -1300,7 +1316,7 @@ def page_forecast():
              "delta_dir": "up" if adj_trends.get("rev_per_kpi", 1.0) >= 1 else "down",
              "sub": f"Last year: ${base['rev_per_kpi_naive']:,.4f}"},
             {"label": "Horizon", "value": f"{base['n_future_weeks']} wk", "sub": f"Baseline {base['n_baseline_weeks']} wk"},
-            {"label": "Channels", "value": f"{len(channels)}", "sub": f"±{constraint:.0%} max shift"},
+            {"label": "Channels", "value": f"{len(channels)}", "sub": f"{constraint_label(constraint)} max shift"},
         ])
         md('<div style="height:6px"></div>')
         p1, p2 = st.columns(2)
@@ -1378,7 +1394,7 @@ def page_forecast():
     gp = r["gain"] / r["sq_total"] * 100 if r["sq_total"] else 0
     with card("card_fc_kpis"):
         card_title(f"Results — {r['quarter']}",
-                   f"${r['budget']:,.0f} budget · channels held within ±{r['constraint']:.0%} of status quo")
+                   f"${r['budget']:,.0f} budget · channels held within {constraint_label(r['constraint'])} of status quo")
         kpi_row([
             {"label": "Status quo incremental revenue", "value": fmt_money(r["sq_total"]),
              "bar": r["sq_total"] / max(r["op_total"], r["sq_total"], 1e-9), "bar_color": INK},
@@ -1455,7 +1471,7 @@ def page_sensitivity():
         with s4:
             gstep = st.number_input("Step", value=0.05, min_value=0.01, step=0.01, format="%.2f")
         with s5:
-            s_con = st.slider("Max shift (±%)", 5, 100, 30, 5, key="sens_con") / 100
+            s_con = shift_slider("sens_con", "Max shift (%)")
 
         if gmax < gmin:
             st.error("Max must be ≥ min.")
@@ -1500,7 +1516,7 @@ def page_sensitivity():
     gdiv, gunit = money_scale(sdf["gain"].values)
 
     with card("card_sens_kpis"):
-        card_title(f"Results — {sr_['quarter']}", f"{len(sdf)} runs · ±{s_con:.0%} max shift")
+        card_title(f"Results — {sr_['quarter']}", f"{len(sdf)} runs · {constraint_label(s_con)} max shift")
         gmin_i, gmax_i = sdf["gain"].idxmin(), sdf["gain"].idxmax()
         kpi_row([
             {"label": "Gain range", "value": f"{fmt_money(sdf['gain'].min())} – {fmt_money(sdf['gain'].max())}",
@@ -1567,7 +1583,7 @@ def page_backtest():
         with b1:
             bt_qs = st.multiselect("Quarters to backtest", eligible, default=[eligible[-1]])
         with b2:
-            b_con = st.slider("Max shift (±%)", 5, 100, 30, 5, key="bt_con") / 100
+            b_con = shift_slider("bt_con", "Max shift (%)")
 
         if _btn("Run backtest", icon=":material/replay:", type="primary", disabled=not bt_qs):
             out = []
