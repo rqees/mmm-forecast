@@ -1,6 +1,6 @@
 # MMM Budget Optimizer
 
-Given a fixed quarterly media budget and two years of weekly spend and revenue history, recommend how to split next quarter's budget across channels to maximise incremental revenue, and show how far to trust the answer.
+Given a fixed quarterly media budget and 118 weeks of spend and revenue history, recommend how to split next quarter's budget across channels to maximise incremental revenue, and show how far to trust the answer.
 
 **Problem.** A retail advertiser spends about $6M a quarter across six channels, with the split carried forward from prior periods. Channel returns diminish at different rates, media effects carry over between weeks, and paid search rises and falls with organic demand, so last-click reporting overstates it. None of that is visible in a spreadsheet.
 
@@ -84,13 +84,12 @@ Next steps, in priority order, are in [docs/DOCUMENTATION.md](docs/DOCUMENTATION
 ## Repository
 
 ```
-app.py               Streamlit app and the whole pipeline (single module)
-colab_launcher.py    One-cell Colab launcher: install, mount Drive, tunnel
-config.toml          Streamlit theme; place at .streamlit/config.toml
-requirements.txt     streamlit, google-meridian[and-cuda,schema], plotly
+app.py                  Streamlit app and the whole pipeline (single module)
+colab_launcher.py       One-cell Colab launcher: install, mount Drive, tunnel
+config.toml             Streamlit theme; place at .streamlit/config.toml
+requirements.txt        streamlit, google-meridian[and-cuda,schema], plotly
 docs/DOCUMENTATION.md   Full technical documentation for the next maintainer
-mmm_budget_optimizer.ipynb                 Earlier notebook version of the pipeline
-Copy_of_Meridian_Getting_Started(1).ipynb  Meridian's sample walkthrough, used to build on
+notebooks/              Meridian's sample walkthrough and the v1 notebook pipeline the app grew out of
 ```
 
 Built during a four-week data science internship at Jellyfish, August to September 2026. Client data is not included.

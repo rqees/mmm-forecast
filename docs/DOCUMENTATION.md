@@ -1,6 +1,6 @@
 # MMM Budget Optimizer: technical documentation
 
-Internship deliverable, September 2026. Author: Raees Kabir. Reviewer: [POC name].
+Internship deliverable, September 2026. Author: Raees Kabir. Supervisor: Shanavas Kavu.
 Repository: https://github.com/rqees/mmm-forecast
 
 This document is written for the data scientist who inherits the tool. It assumes familiarity with regression and basic Bayesian ideas, and explains marketing-mix-modelling terms on first use. It is organised by what you are trying to do:
@@ -68,8 +68,8 @@ An MMM estimates all three from history. Meridian was chosen because it is the c
 
 | Phase | Dataset | Notes |
 |---|---|---|
-| Build | Meridian's synthetic sample (`Copy_of_Meridian_Getting_Started(1).ipynb`) | Five channels, geo-level, includes promotion, organic media, competitor and sentiment columns. Used to build and test the pipeline. |
-| Delivery | Client weekly data | Six channels: audio, search, social, streaming, tv, video. Conversions as KPI, revenue per conversion, Google query volume as control. Roughly June 2023 to Q3 2025, about 2.3 years. Confirm exact range from the Model status card. |
+| Build | Meridian's synthetic sample (`notebooks/meridian_getting_started.ipynb`) | Five channels, geo-level, includes promotion, organic media, competitor and sentiment columns. Used to build and test the pipeline. |
+| Delivery | Client weekly data | Six channels: audio, search, social, streaming, tv, video. Conversions as KPI, revenue per conversion, Google query volume as control. 118 weeks, 2023-06-14 to 2025-09-10. |
 
 ### 3.2 Required schema (wide layout)
 
