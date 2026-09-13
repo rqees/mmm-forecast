@@ -216,3 +216,13 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Data and model artifacts. Client data must never be committed; only the
+# synthetic sample and its generator are tracked.
+data/*
+!data/make_sample.py
+!data/sample_weekly.csv
+*.csv
+!data/sample_weekly.csv
+*.binpb
+*_config.json
