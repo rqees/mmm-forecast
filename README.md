@@ -1,5 +1,5 @@
 # MMM Budget Optimizer
-[https://github.com/rqees/mmm-forecast/blob/main/docs/images/forecast_page.png]
+![Forecast Page View](https://github.com/rqees/mmm-forecast/raw/main/docs/images/forecast_page.png)
 
 A Bayesian causal inference tool for marketing budget allocation, built during my 2026 summer data science internship at [Jellyfish](https://jellyfish.com). Given weekly advertising data across channels, it estimates each channel's diminishing-returns curve via [MCMC](https://en.wikipedia.org/wiki/Markov_chain_Monte_Carlo), forecasts next quarter's inputs, and optimizes the budget split to maximize incremental revenue. The results is validated on held-out data.
 
@@ -28,7 +28,7 @@ The tool wraps [Google Meridian](https://github.com/google/meridian), an open-so
 2. **Future-period optimization** - builds the data tensors for a quarter that hasn't happened yet and passes them to Meridian's optimizer, which natively only works on historical periods.
 3. **Holdout backtesting** - refits the model with a past quarter's outcomes masked, predicts revenue from the spend that actually ran, and scores against actuals.
 
-[https://github.com/rqees/mmm-forecast/blob/main/docs/images/forecast_page.png]
+![Backtest Page View](https://github.com/rqees/mmm-forecast/raw/main/docs/images/backtest_page.png)
 
 
 ## Methods
