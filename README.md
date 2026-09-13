@@ -1,15 +1,15 @@
 # MMM Budget Optimizer
+[https://github.com/rqees/mmm-forecast/blob/main/docs/images/forecast_page.png]
 
 A Bayesian causal inference tool for marketing budget allocation, built during my 2026 summer data science internship at [Jellyfish](https://jellyfish.com). Given weekly advertising data across channels, it estimates each channel's diminishing-returns curve via [MCMC](https://en.wikipedia.org/wiki/Markov_chain_Monte_Carlo), forecasts next quarter's inputs, and optimizes the budget split to maximize incremental revenue. The results is validated on held-out data.
 
-**Author:** Raees Kabir
-**Supervisor:** Shanavas Kavu, Senior Director Data Science @ Jellyfish · Full documentation in [docs/DOCUMENTATION.md](docs/DOCUMENTATION.md)
-
-![Forecast results at a 30% constraint](docs/images/forecast-results.png)
+**Author:** Raees Kabir \
+**Supervisor:** Shanavas Kavu, Senior Director Data Science @ Jellyfish \
+Full documentation in [docs/DOCUMENTATION.md](docs/DOCUMENTATION.md)
 
 ## Context
 
-During my internship, I learned marketing mix modeling from scratch, built this tool end-to-end, tested it on real client data, and [presented the results](https://github.com/rqees/mmm-forecast/blob/main/review_deck.pptx) to the analytics team.
+During my internship, I learned marketing mix modeling from scratch, built this tool end-to-end, tested it on real client data, and presented the results to the  team.
 
 I  was interested in working on this problem because I wanted to learn the skills to turn raw observational data into actionable, uncertainty-aware decisions.
 
@@ -28,6 +28,11 @@ The tool wraps [Google Meridian](https://github.com/google/meridian), an open-so
 2. **Future-period optimization** - builds the data tensors for a quarter that hasn't happened yet and passes them to Meridian's optimizer, which natively only works on historical periods.
 3. **Holdout backtesting** - refits the model with a past quarter's outcomes masked, predicts revenue from the spend that actually ran, and scores against actuals.
 
+[https://github.com/rqees/mmm-forecast/blob/main/docs/images/forecast_page.png]
+
+
+## Methods
+
 ```mermaid
 flowchart LR
     A[Weekly CSV<br/>spend, impressions, KPI,<br/>revenue per KPI, controls] --> B[Map columns<br/>aggregate geos to national<br/>add seasonal terms]
@@ -39,8 +44,6 @@ flowchart LR
     F --> G[Recommended allocation<br/>gain, ROAS per channel]
     C --> H[Backtest<br/>refit with quarter hidden,<br/>predict vs actual]
 ```
-
-## Methods
 
 ### Bayesian model (Meridian)
 
